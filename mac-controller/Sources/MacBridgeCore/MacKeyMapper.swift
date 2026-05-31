@@ -14,7 +14,9 @@ public enum MacKeyMapper {
         126: "ArrowUp",
         27: "Minus", 24: "Equal", 33: "BracketLeft", 30: "BracketRight",
         42: "Backslash", 41: "Semicolon", 39: "Quote", 43: "Comma",
-        47: "Period", 44: "Slash", 50: "Backquote"
+        47: "Period", 44: "Slash", 50: "Backquote",
+        55: "Command", 56: "Shift", 58: "Option", 59: "Control",
+        60: "Shift", 61: "Option", 62: "Control", 63: "Fn"
     ]
 
     public static func stableKey(for keyCode: Int) -> String? {
