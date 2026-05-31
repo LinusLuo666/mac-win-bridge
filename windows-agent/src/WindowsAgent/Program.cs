@@ -32,12 +32,6 @@ while (true)
             continue;
         }
 
-        if (message.Event == "flagsChanged")
-        {
-            Console.WriteLine($"flagsChanged sequence={message.Sequence}");
-            continue;
-        }
-
         try
         {
             injector.Inject(message);
@@ -47,6 +41,15 @@ while (true)
         {
             Console.WriteLine($"injection failed sequence={message.Sequence}: {ex.Message}");
         }
+    }
+
+    try
+    {
+        injector.ReleaseAllModifiers();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"modifier release failed: {ex.Message}");
     }
 
     Console.WriteLine("client disconnected");
