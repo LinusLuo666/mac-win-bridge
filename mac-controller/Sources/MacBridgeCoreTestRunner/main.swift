@@ -1,0 +1,115 @@
+import Foundation
+import MacBridgeCore
+
+struct TestFailure: Error, CustomStringConvertible {
+    let description: String
+}
+
+func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String) throws {
+    if actual != expected {
+        throw TestFailure(description: "\(message): expected \(expected), got \(actual)")
+    }
+}
+
+func expectNil<T>(_ actual: T?, _ message: String) throws {
+    if let actual {
+        throw TestFailure(description: "\(message): expected nil, got \(actual)")
+    }
+}
+
+func expectTrue(_ actual: Bool, _ message: String) throws {
+    if !actual {
+        throw TestFailure(description: "\(message): expected true")
+    }
+}
+
+func expectFalse(_ actual: Bool, _ message: String) throws {
+    if actual {
+        throw TestFailure(description: "\(message): expected false")
+    }
+}
+
+func run(_ name: String, _ test: () throws -> Void) -> Bool {
+    do {
+        try test()
+        print("PASS \(name)")
+        return true
+    } catch {
+        print("FAIL \(name): \(error)")
+        return false
+    }
+}
+
+let tests: [(String, () throws -> Void)] = [
+    ("KeyboardEventKind raw values", {
+        try expectEqual(KeyboardEventKind.down.rawValue, "down", "down raw value")
+        try expectEqual(KeyboardEventKind.up.rawValue, "up", "up raw value")
+        try expectEqual(KeyboardEventKind.flagsChanged.rawValue, "flagsChanged", "flagsChanged raw value")
+    }),
+    ("KeyboardMessage encodes one JSON line", {
+        let message = KeyboardMessage(
+            event: .down,
+            key: "KeyA",
+            modifiers: [.shift],
+            sequence: 42
+        )
+
+        let line = try message.jsonLine()
+
+        try expectEqual(
+            line,
+            #"{"type":"key","event":"down","key":"KeyA","modifiers":["shift"],"sequence":42}"# + "\n",
+            "encoded key down message"
+        )
+    }),
+    ("KeyboardMessage encodes empty modifiers", {
+        let message = KeyboardMessage(
+            event: .up,
+            key: "Enter",
+            modifiers: [],
+            sequence: 7
+        )
+
+        let line = try message.jsonLine()
+
+        try expectEqual(
+            line,
+            #"{"type":"key","event":"up","key":"Enter","modifiers":[],"sequence":7}"# + "\n",
+            "encoded key up message"
+        )
+    }),
+    ("MacKeyMapper maps M0 keys", {
+        try expectEqual(MacKeyMapper.stableKey(for: 0), "KeyA", "A key")
+        try expectEqual(MacKeyMapper.stableKey(for: 11), "KeyB", "B key")
+        try expectEqual(MacKeyMapper.stableKey(for: 18), "Digit1", "1 key")
+        try expectEqual(MacKeyMapper.stableKey(for: 36), "Enter", "enter key")
+        try expectEqual(MacKeyMapper.stableKey(for: 48), "Tab", "tab key")
+        try expectEqual(MacKeyMapper.stableKey(for: 49), "Space", "space key")
+        try expectEqual(MacKeyMapper.stableKey(for: 51), "Backspace", "backspace key")
+        try expectEqual(MacKeyMapper.stableKey(for: 53), "Escape", "escape key")
+        try expectEqual(MacKeyMapper.stableKey(for: 123), "ArrowLeft", "left arrow")
+        try expectEqual(MacKeyMapper.stableKey(for: 124), "ArrowRight", "right arrow")
+        try expectEqual(MacKeyMapper.stableKey(for: 125), "ArrowDown", "down arrow")
+        try expectEqual(MacKeyMapper.stableKey(for: 126), "ArrowUp", "up arrow")
+    }),
+    ("MacKeyMapper returns nil for unsupported keys", {
+        try expectNil(MacKeyMapper.stableKey(for: 999), "unsupported key")
+    }),
+    ("EscapeShortcut recognizes Control Option Escape", {
+        try expectTrue(
+            EscapeShortcut.isEscape(keyCode: 53, modifiers: [.control, .option]),
+            "control option escape"
+        )
+    }),
+    ("EscapeShortcut rejects similar shortcuts", {
+        try expectFalse(EscapeShortcut.isEscape(keyCode: 53, modifiers: [.control]), "control escape")
+        try expectFalse(EscapeShortcut.isEscape(keyCode: 53, modifiers: [.option]), "option escape")
+        try expectFalse(EscapeShortcut.isEscape(keyCode: 36, modifiers: [.control, .option]), "control option enter")
+        try expectFalse(EscapeShortcut.isEscape(keyCode: 53, modifiers: [.control, .option, .shift]), "extra shift")
+    })
+]
+
+let passed = tests.map { run($0.0, $0.1) }.filter { $0 }.count
+let failed = tests.count - passed
+print("Ran \(tests.count) tests: \(passed) passed, \(failed) failed")
+exit(failed == 0 ? 0 : 1)
