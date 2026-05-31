@@ -95,6 +95,16 @@ let tests: [(String, () throws -> Void)] = [
     ("MacKeyMapper returns nil for unsupported keys", {
         try expectNil(MacKeyMapper.stableKey(for: 999), "unsupported key")
     }),
+    ("MacKeyMapper maps modifier keys for flagsChanged events", {
+        try expectEqual(MacKeyMapper.stableKey(for: 55), "Command", "left command")
+        try expectEqual(MacKeyMapper.stableKey(for: 56), "Shift", "left shift")
+        try expectEqual(MacKeyMapper.stableKey(for: 58), "Option", "left option")
+        try expectEqual(MacKeyMapper.stableKey(for: 59), "Control", "left control")
+        try expectEqual(MacKeyMapper.stableKey(for: 60), "Shift", "right shift")
+        try expectEqual(MacKeyMapper.stableKey(for: 61), "Option", "right option")
+        try expectEqual(MacKeyMapper.stableKey(for: 62), "Control", "right control")
+        try expectEqual(MacKeyMapper.stableKey(for: 63), "Fn", "function key")
+    }),
     ("EscapeShortcut recognizes Control Option Escape", {
         try expectTrue(
             EscapeShortcut.isEscape(keyCode: 53, modifiers: [.control, .option]),
