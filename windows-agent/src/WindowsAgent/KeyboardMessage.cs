@@ -15,7 +15,7 @@ public sealed record KeyboardMessage(
         try
         {
             var message = JsonSerializer.Deserialize<KeyboardMessage>(line);
-            return message is { Type: "key" } ? message : null;
+            return message is { Type: ProtocolMessageType.Key } ? message : null;
         }
         catch (JsonException)
         {

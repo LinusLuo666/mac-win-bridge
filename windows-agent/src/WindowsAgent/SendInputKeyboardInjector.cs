@@ -7,16 +7,16 @@ public sealed class SendInputKeyboardInjector
 {
     private const uint InputKeyboard = 1;
     private const uint KeyEventKeyUp = 0x0002;
-    private readonly KeyboardInputPlanner _planner = new();
+    private readonly KeyboardInputPlanner planner = new();
 
     public void Inject(KeyboardMessage message)
     {
-        Send(_planner.Plan(message));
+        Send(planner.Plan(message));
     }
 
     public void ReleaseAllModifiers()
     {
-        Send(_planner.ReleaseAllModifiers());
+        Send(planner.ReleaseAllModifiers());
     }
 
     private static void Send(IReadOnlyList<KeyboardStroke> strokes)
@@ -68,7 +68,7 @@ public sealed class SendInputKeyboardInjector
         public InputUnion Data;
     }
 
-    [StructLayout(LayoutKind.Explicit)]
+    [StructLayout(LayoutKind.Explicit, Size = 32)]
     private struct InputUnion
     {
         [FieldOffset(0)] public KeyboardInputData Keyboard;
