@@ -43,14 +43,67 @@ swift run --package-path mac-controller mac-controller <windows-host> 5055
 
 The Mac process needs Accessibility and Input Monitoring permission. Press `Control + Option + Escape` to stop forwarding.
 
+Enable the prototype audio bridge manually:
+
+```bash
+scripts/start-mac-audio.sh <windows-host-or-ip> 5055
+```
+
+`--audio-only` leaves the Mac keyboard local. Use `--audio` instead when keyboard forwarding and audio should run together. Audio mode can be `lowLatency` or `stable`; `--muted` keeps the stream active without local playback volume.
+
 ### Windows Agent
 
 Build and test on Windows with .NET SDK:
 
 ```powershell
 dotnet test windows-agent\tests\WindowsAgent.Tests\WindowsAgent.Tests.csproj
-dotnet run --project windows-agent\src\WindowsAgent\WindowsAgent.csproj -- 5055
+.\scripts\start-windows-agent.ps1 -Port 5055
 ```
+
+The Windows agent starts WASAPI loopback capture only after the Mac controller sends an `audioControl` message. Captured system output is streamed back over the same TCP connection as length-prefixed PCM frames.
+
+Manual startup order:
+
+1. On Windows, open PowerShell in the repo and run `.\scripts\start-windows-agent.ps1 -Port 5055`.
+2. Confirm the log says `WindowsAgent listening on port 5055`.
+3. On Windows, run `ipconfig` and copy the WLAN IPv4 address.
+4. On Mac, run `scripts/start-mac-audio.sh <windows-wlan-ip> 5055`.
+5. Leave both terminal windows open. Stop Mac with `Control+C`; stop Windows with `Ctrl+C`.
+
+Local manager page:
+
+```bash
+scripts/audio-bridge-manager.py
+```
+
+Open `http://127.0.0.1:8765` on the Mac. The page can start and stop the managed Mac audio client, check whether the Windows port is reachable, show the Windows start command, and tail the Mac audio log.
+
+### Audio Bridge Protocol
+
+Mac to Windows control message:
+
+```json
+{"type":"audioControl","enabled":true,"mode":"lowLatency","volume":1.0,"muted":false}
+```
+
+Windows to Mac sends binary frames on the same TCP connection:
+
+- byte 0: message type, fixed `0xA1`
+- byte 1..4: little-endian `Int32` payload length
+- payload byte 0..23: audio metadata
+- payload byte 24..end: interleaved PCM bytes
+
+Metadata layout:
+
+- byte 0..3: little-endian `Int32` sample rate
+- byte 4..5: little-endian `UInt16` channel count
+- byte 6..7: little-endian `UInt16` bits per sample
+- byte 8..9: little-endian `UInt16` wave format tag
+- byte 10..11: little-endian `UInt16` block align
+- byte 12..15: little-endian `Int32` frame count
+- byte 16..23: little-endian `UInt64` QPC position
+
+Supported Mac playback encodings are 16/24/32-bit PCM integer and 32-bit IEEE float, including `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`) when the bit depth maps cleanly.
 
 ### Manual Validation
 
