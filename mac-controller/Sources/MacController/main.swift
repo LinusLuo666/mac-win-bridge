@@ -24,6 +24,20 @@ final class TcpLineSender {
         outputStream = write
         inputStream?.open()
         outputStream?.open()
+
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            if outputStream?.streamStatus == .open || outputStream?.hasSpaceAvailable == true {
+                return
+            }
+            if outputStream?.streamStatus == .error {
+                throw outputStream?.streamError ?? RuntimeError("TCP connection failed")
+            }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+
+        close()
+        throw RuntimeError("TCP connection timed out after 5 seconds")
     }
 
     func send(_ line: String) throws {
@@ -32,9 +46,15 @@ final class TcpLineSender {
         }
 
         let bytes = Array(line.utf8)
-        let written = outputStream.write(bytes, maxLength: bytes.count)
-        if written != bytes.count {
-            throw RuntimeError("failed to send full message")
+        var offset = 0
+        while offset < bytes.count {
+            let written = bytes.withUnsafeBufferPointer { pointer in
+                outputStream.write(pointer.baseAddress! + offset, maxLength: bytes.count - offset)
+            }
+            if written <= 0 {
+                throw outputStream.streamError ?? RuntimeError("failed to send full message")
+            }
+            offset += written
         }
     }
 
@@ -44,6 +64,13 @@ final class TcpLineSender {
         }
 
         return inputStream
+    }
+
+    func close() {
+        inputStream?.close()
+        outputStream?.close()
+        inputStream = nil
+        outputStream = nil
     }
 }
 
@@ -192,6 +219,61 @@ struct ControllerOptions {
     }
 }
 
+func audioControlMessage(options: ControllerOptions, enabled: Bool) throws -> String {
+    try AudioControlMessage(
+        enabled: enabled,
+        mode: options.audioMode,
+        volume: options.volume,
+        muted: enabled ? options.muted : true
+    ).jsonLine()
+}
+
+func runAudioOnly(options: ControllerOptions) -> Never {
+    var backoff = ReconnectBackoff()
+
+    while true {
+        let sender = TcpLineSender()
+        let disconnected = DispatchSemaphore(value: 0)
+        var player: AudioStreamPlayer?
+        var connectedAt: Date?
+
+        do {
+            try sender.connect(host: options.windowsHost, port: options.port)
+            connectedAt = Date()
+            player = try AudioStreamPlayer(
+                inputStream: sender.audioInputStream(),
+                volume: options.volume,
+                muted: options.muted,
+                onTermination: { error in
+                    if let error {
+                        print("audio connection ended: \(error)")
+                    } else {
+                        print("audio connection closed by Windows")
+                    }
+                    disconnected.signal()
+                }
+            )
+            player?.start()
+            try sender.send(audioControlMessage(options: options, enabled: true))
+            print("audio bridge requested mode=\(options.audioMode.rawValue)")
+            print("audio-only mode connected to \(options.windowsHost):\(options.port); keyboard remains local")
+            disconnected.wait()
+        } catch {
+            print("audio-only connection failed: \(error)")
+        }
+
+        player?.stop()
+        sender.close()
+
+        if let connectedAt, Date().timeIntervalSince(connectedAt) >= 10 {
+            backoff.reset()
+        }
+        let delay = backoff.nextDelay()
+        print(String(format: "reconnecting to %@:%d in %.0f seconds", options.windowsHost, options.port, delay))
+        Thread.sleep(forTimeInterval: delay)
+    }
+}
+
 let args = CommandLine.arguments
 guard let options = ControllerOptions.parse(args) else {
     print("usage: mac-controller <windows-host> <port> [--audio|--audio-only] [--audio-mode lowLatency|stable] [--volume 0.0-1.0] [--muted]")
@@ -201,6 +283,10 @@ guard let options = ControllerOptions.parse(args) else {
 guard !options.keyboardEnabled || AXIsProcessTrusted() else {
     print("missing Accessibility/Input Monitoring permission for keyboard event capture")
     exit(77)
+}
+
+if !options.keyboardEnabled && options.audioEnabled {
+    runAudioOnly(options: options)
 }
 
 let sender = TcpLineSender()
@@ -217,15 +303,16 @@ if options.audioEnabled {
         audioPlayer = try AudioStreamPlayer(
             inputStream: sender.audioInputStream(),
             volume: options.volume,
-            muted: options.muted
+            muted: options.muted,
+            onTermination: { error in
+                if let error {
+                    print("audio connection ended: \(error)")
+                }
+                CFRunLoopStop(CFRunLoopGetMain())
+            }
         )
         audioPlayer?.start()
-        try sender.send(AudioControlMessage(
-            enabled: true,
-            mode: options.audioMode,
-            volume: options.volume,
-            muted: options.muted
-        ).jsonLine())
+        try sender.send(audioControlMessage(options: options, enabled: true))
         print("audio bridge requested mode=\(options.audioMode.rawValue)")
     } catch {
         print("audio setup failed: \(error)")
@@ -261,22 +348,15 @@ if options.keyboardEnabled {
     CGEvent.tapEnable(tap: tap, enable: true)
     print("forwarding keyboard events to \(options.windowsHost):\(options.port); press Control+Option+Escape to stop")
     CFRunLoopRun()
-} else {
-    print("audio-only mode connected to \(options.windowsHost):\(options.port); keyboard remains local")
-    CFRunLoopRun()
 }
 
 if options.audioEnabled {
     do {
-        try sender.send(AudioControlMessage(
-            enabled: false,
-            mode: options.audioMode,
-            volume: options.volume,
-            muted: true
-        ).jsonLine())
+        try sender.send(audioControlMessage(options: options, enabled: false))
     } catch {
         print("audio shutdown message failed: \(error)")
     }
 
     audioPlayer?.stop()
 }
+sender.close()

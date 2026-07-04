@@ -165,6 +165,17 @@ let tests: [(String, () throws -> Void)] = [
         }
         try expectEqual(result, Data(source), "joined bytes")
     }),
+    ("ReconnectBackoff grows and caps delay", {
+        var backoff = ReconnectBackoff(maximumDelay: 10)
+        try expectEqual(backoff.nextDelay(), 1, "first delay")
+        try expectEqual(backoff.nextDelay(), 2, "second delay")
+        try expectEqual(backoff.nextDelay(), 4, "third delay")
+        try expectEqual(backoff.nextDelay(), 8, "fourth delay")
+        try expectEqual(backoff.nextDelay(), 10, "capped delay")
+        try expectEqual(backoff.nextDelay(), 10, "remains capped")
+        backoff.reset()
+        try expectEqual(backoff.nextDelay(), 1, "reset delay")
+    }),
     ("MacKeyMapper maps M0 keys", {
         try expectEqual(MacKeyMapper.stableKey(for: 0), "KeyA", "A key")
         try expectEqual(MacKeyMapper.stableKey(for: 11), "KeyB", "B key")

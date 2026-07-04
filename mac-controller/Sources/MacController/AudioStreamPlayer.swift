@@ -6,6 +6,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private let inputStream: InputStream
     private let volume: Float
     private let muted: Bool
+    private let onTermination: @Sendable (Error?) -> Void
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private let stateLock = NSLock()
@@ -18,10 +19,16 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private var statisticsStartedAt: Date?
     private var nextStatisticsLogAt = 5.0
 
-    init(inputStream: InputStream, volume: Double, muted: Bool) {
+    init(
+        inputStream: InputStream,
+        volume: Double,
+        muted: Bool,
+        onTermination: @escaping @Sendable (Error?) -> Void
+    ) {
         self.inputStream = inputStream
         self.volume = Float(min(max(volume, 0), 1))
         self.muted = muted
+        self.onTermination = onTermination
     }
 
     func start() {
@@ -41,6 +48,8 @@ final class AudioStreamPlayer: @unchecked Sendable {
     }
 
     private func run() {
+        var terminationError: Error?
+        defer { onTermination(terminationError) }
         do {
             while shouldRun {
                 guard let header = try readExactly(byteCount: WindowsAudioFrameProtocol.headerLength) else {
@@ -62,6 +71,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
                 record(frame: frame)
             }
         } catch {
+            terminationError = error
             if shouldRun {
                 print("audio playback failed: \(error)")
             }
