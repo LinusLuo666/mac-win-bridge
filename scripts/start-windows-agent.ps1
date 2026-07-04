@@ -16,6 +16,36 @@ $StatePath = Join-Path $StateDirectory "windows-agent.json"
 $StdoutPath = Join-Path $StateDirectory "windows-agent.stdout.log"
 $StderrPath = Join-Path $StateDirectory "windows-agent.stderr.log"
 
+function Get-WlanIPv4 {
+    param([string[]]$IpConfigLines = @(& ipconfig))
+
+    $inWlan = $false
+    foreach ($line in $IpConfigLines) {
+        if ($line -match '^\S.*adapter\s+WLAN:\s*$') {
+            $inWlan = $true
+            continue
+        }
+        if ($inWlan -and $line -match '^\S') {
+            break
+        }
+        if ($inWlan -and $line -match 'IPv4[^:]*:\s*(\d{1,3}(?:\.\d{1,3}){3})\s*$') {
+            return $Matches[1]
+        }
+    }
+
+    return $null
+}
+
+function Show-WlanIPv4 {
+    param([AllowNull()][string]$Address = (Get-WlanIPv4))
+
+    if ([string]::IsNullOrWhiteSpace($Address)) {
+        return "Windows WLAN IPv4: unavailable"
+    }
+
+    return "Windows WLAN IPv4: $Address"
+}
+
 function Get-PortEntries {
     $pattern = "^\s*TCP\s+\S+:$Port\s+\S+\s+(LISTENING|ESTABLISHED)\s+\d+\s*$"
     return @(netstat -ano -p tcp | Select-String -Pattern $pattern | ForEach-Object {
@@ -50,6 +80,7 @@ function Read-State {
 }
 
 function Show-Status {
+    Show-WlanIPv4
     $entries = Get-PortEntries
     $listener = $entries | Where-Object State -eq "LISTENING" | Select-Object -First 1
     if ($null -eq $listener) {
@@ -179,12 +210,17 @@ function Show-Logs {
     }
 }
 
+if ($MyInvocation.InvocationName -eq ".") {
+    return
+}
+
 switch ($Action) {
     "Start" { Start-Background }
     "Stop" { Stop-Agent }
     "Status" { Show-Status }
     "Logs" { Show-Logs }
     "Foreground" {
+        Show-WlanIPv4
         Set-Location $Root
         Write-Output "Starting WindowsAgent in foreground on port $Port. Press Ctrl+C to stop."
         & dotnet run --project $Project --configuration Release -- $Port
