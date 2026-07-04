@@ -8,9 +8,21 @@ public sealed class WasapiLoopbackAudioStreamer
     private static readonly Guid AudioClientId = new("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2");
     private static readonly Guid AudioCaptureClientId = new("C8ADBD64-E71E-48a0-A4DE-185C395CD317");
 
-    public void Stream(AudioFrameWriter writer, CancellationToken cancellationToken)
+    public void Stream(
+        AudioFrameWriter writer,
+        CancellationToken cancellationToken,
+        Action<string>? log = null)
+    {
+        AudioDeviceRecovery.Run(
+            () => StreamOnce(writer, cancellationToken),
+            cancellationToken,
+            log ?? (_ => { }));
+    }
+
+    private static void StreamOnce(AudioFrameWriter writer, CancellationToken cancellationToken)
     {
         var initializedCom = false;
+        object? deviceEnumeratorObject = null;
         object? audioClientObject = null;
         object? captureClientObject = null;
         IMMDevice? device = null;
@@ -29,7 +41,9 @@ public sealed class WasapiLoopbackAudioStreamer
 
             var enumeratorType = Type.GetTypeFromCLSID(MMDeviceEnumeratorId, throwOnError: true)
                 ?? throw new InvalidOperationException("Failed to create WASAPI device enumerator type.");
-            var enumerator = (IMMDeviceEnumerator)Activator.CreateInstance(enumeratorType)!;
+            deviceEnumeratorObject = Activator.CreateInstance(enumeratorType);
+            var enumerator = (IMMDeviceEnumerator?)deviceEnumeratorObject
+                ?? throw new InvalidOperationException("Failed to create WASAPI device enumerator.");
             ThrowIfFailed(enumerator.GetDefaultAudioEndpoint(EDataFlow.Render, ERole.Console, out device));
             var audioClientId = AudioClientId;
             ThrowIfFailed(device.Activate(ref audioClientId, ClsCtx.All, IntPtr.Zero, out audioClientObject));
@@ -74,6 +88,7 @@ public sealed class WasapiLoopbackAudioStreamer
             ReleaseComObject(captureClientObject);
             ReleaseComObject(audioClientObject);
             ReleaseComObject(device);
+            ReleaseComObject(deviceEnumeratorObject);
 
             if (initializedCom)
             {

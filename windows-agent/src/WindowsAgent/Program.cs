@@ -55,7 +55,10 @@ while (true)
         {
             try
             {
-                new WasapiLoopbackAudioStreamer().Stream(audioWriter, cancellationToken);
+                new WasapiLoopbackAudioStreamer().Stream(
+                    audioWriter,
+                    cancellationToken,
+                    Console.WriteLine);
             }
             catch (OperationCanceledException)
             {
