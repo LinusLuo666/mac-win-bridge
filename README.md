@@ -22,116 +22,116 @@ Mac Win Bridge 是一个面向双机桌面场景的个人效率工具：让 MacB
 
 第一版只做输入与音频桥接，不做 Windows 画面串流，不做完整远程桌面。
 
-## M0 Input Bridge Prototype
+## M0 输入桥接原型
 
 M0 是键盘桥接技术验证：Mac 端捕获键盘事件，经 TCP 发送 JSON Lines 消息；Windows 端接收消息并用 `SendInput` 注入到当前桌面会话。
 
-### Mac Controller
+### Mac 控制端
 
-Build and test:
+构建并测试：
 
 ```bash
 swift run --package-path mac-controller mac-controller-tests
 swift build --package-path mac-controller
 ```
 
-Run:
+运行：
 
 ```bash
 swift run --package-path mac-controller mac-controller <windows-host> 5055
 ```
 
-The Mac process needs Accessibility and Input Monitoring permission. Press `Control + Option + Escape` to stop forwarding.
+Mac 进程需要获得“辅助功能”和“输入监控”权限。按 `Control + Option + Escape` 停止转发。
 
-Enable the prototype audio bridge manually:
+手动启用音频桥接原型：
 
 ```bash
 scripts/start-mac-audio.sh <windows-host-or-ip> 5055
 ```
 
-`--audio-only` leaves the Mac keyboard local. Use `--audio` instead when keyboard forwarding and audio should run together. Audio mode can be `lowLatency` or `stable`; `--muted` keeps the stream active without local playback volume.
+`--audio-only` 模式会让 Mac 键盘继续由本机使用。如果需要同时启用键盘转发和音频，请改用 `--audio`。音频模式可以选择 `lowLatency` 或 `stable`；`--muted` 会保持音频流连接，但不在 Mac 本机播放声音。
 
-### Windows Agent
+### Windows 端代理程序
 
-Build and test on Windows with .NET SDK:
+在安装了 .NET SDK 的 Windows 上构建并测试：
 
 ```powershell
 dotnet test windows-agent\tests\WindowsAgent.Tests\WindowsAgent.Tests.csproj
 .\scripts\start-windows-agent.ps1 -Port 5055
 ```
 
-The Windows agent starts WASAPI loopback capture only after the Mac controller sends an `audioControl` message. Captured system output is streamed back over the same TCP connection as length-prefixed PCM frames.
+Windows 端代理程序只有在收到 Mac 控制端发送的 `audioControl` 消息后，才会启动 WASAPI 回环采集。采集到的系统输出声音会通过同一个 TCP 连接，以带长度前缀的 PCM 音频帧发送到 Mac。
 
-Windows management commands:
+Windows 管理命令：
 
 ```powershell
-# Foreground: keep this terminal open; Ctrl+C stops the agent.
+# 前台启动：需要保持当前终端打开，按 Ctrl+C 停止代理程序。
 .\scripts\start-windows-agent.ps1 -Action Foreground -Port 5055
 
-# Persistent background process with logs under %LOCALAPPDATA%\MacWinBridge.
+# 后台启动：进程持续运行，日志保存在 %LOCALAPPDATA%\MacWinBridge。
 .\scripts\start-windows-agent.ps1 -Action Start -Port 5055
 
-# Show the managed PID plus LISTENING and ESTABLISHED sockets.
+# 查看当前 WLAN IPv4、进程 PID，以及 LISTENING 和 ESTABLISHED 连接。
 .\scripts\start-windows-agent.ps1 -Action Status -Port 5055
 
-# Tail recent stdout and stderr.
+# 查看最近的标准输出和错误日志。
 .\scripts\start-windows-agent.ps1 -Action Logs -Tail 200
 
-# Stop the managed listener and verify that port 5055 is released.
+# 停止代理程序，并确认 5055 端口已经释放。
 .\scripts\start-windows-agent.ps1 -Action Stop -Port 5055
 ```
 
-The default action remains `Foreground`, so `.\scripts\start-windows-agent.ps1 -Port 5055` continues to work. Background management is local to Windows and does not require the Mac client to be running.
+默认操作是 `Foreground`，因此仍然可以直接运行 `.\scripts\start-windows-agent.ps1 -Port 5055`。后台管理功能只依赖 Windows 本机，不要求 Mac 客户端正在运行。
 
-Manual startup order:
+手动启动顺序：
 
-1. On Windows, open PowerShell in the repo and run `.\scripts\start-windows-agent.ps1 -Port 5055`.
-2. Confirm the log says `WindowsAgent listening on port 5055`.
-3. On Windows, run `ipconfig` and copy the WLAN IPv4 address.
-4. On Mac, run `scripts/start-mac-audio.sh <windows-wlan-ip> 5055`.
-5. Leave both terminal windows open. Stop Mac with `Control+C`; stop Windows with `Ctrl+C`.
+1. 在 Windows 上打开 PowerShell，进入项目目录，然后运行 `.\scripts\start-windows-agent.ps1 -Port 5055`。
+2. 确认日志出现 `WindowsAgent listening on port 5055`。
+3. 脚本会打印 Windows 的 WLAN IPv4 地址，将该地址填写到 Mac 端。
+4. 在 Mac 上运行 `scripts/start-mac-audio.sh <Windows-WLAN-IP> 5055`。
+5. 前台运行时需要保持两边的终端窗口打开。Mac 端按 `Control+C` 停止，Windows 端按 `Ctrl+C` 停止。
 
-Local manager page:
+本地管理页面：
 
 ```bash
 scripts/audio-bridge-manager.py
 ```
 
-Open `http://127.0.0.1:8765` on the Mac. The page can start and stop the managed Mac audio client, check whether the Windows port is reachable, show the Windows start command, and tail the Mac audio log.
+在 Mac 上打开 `http://127.0.0.1:8765`。该页面可以启动或停止受管理的 Mac 音频客户端、检查 Windows 端口是否可访问、显示 Windows 启动命令，并查看最近的 Mac 音频日志。
 
-### Audio Bridge Protocol
+### 音频桥接协议
 
-Mac to Windows control message:
+Mac 发送到 Windows 的控制消息：
 
 ```json
 {"type":"audioControl","enabled":true,"mode":"lowLatency","volume":1.0,"muted":false}
 ```
 
-Windows to Mac sends binary frames on the same TCP connection:
+Windows 通过同一个 TCP 连接向 Mac 发送二进制帧：
 
-- byte 0: message type, fixed `0xA1`
-- byte 1..4: little-endian `Int32` payload length
-- payload byte 0..23: audio metadata
-- payload byte 24..end: interleaved PCM bytes
+- 第 0 字节：消息类型，固定为 `0xA1`
+- 第 1..4 字节：小端序 `Int32` 载荷长度
+- 载荷第 0..23 字节：音频元数据
+- 载荷第 24 字节至末尾：交错排列的 PCM 数据
 
-Metadata layout:
+元数据布局：
 
-- byte 0..3: little-endian `Int32` sample rate
-- byte 4..5: little-endian `UInt16` channel count
-- byte 6..7: little-endian `UInt16` bits per sample
-- byte 8..9: little-endian `UInt16` wave format tag
-- byte 10..11: little-endian `UInt16` block align
-- byte 12..15: little-endian `Int32` frame count
-- byte 16..23: little-endian `UInt64` QPC position
+- 第 0..3 字节：小端序 `Int32` 采样率
+- 第 4..5 字节：小端序 `UInt16` 声道数
+- 第 6..7 字节：小端序 `UInt16` 每个采样的位数
+- 第 8..9 字节：小端序 `UInt16` 波形格式标记
+- 第 10..11 字节：小端序 `UInt16` 块对齐值
+- 第 12..15 字节：小端序 `Int32` 音频帧数
+- 第 16..23 字节：小端序 `UInt64` QPC 位置
 
-Supported Mac playback encodings are 16/24/32-bit PCM integer and 32-bit IEEE float, including `WAVE_FORMAT_EXTENSIBLE` (`0xFFFE`) when the bit depth maps cleanly.
+Mac 端支持播放 16、24、32 位 PCM 整数格式和 32 位 IEEE 浮点格式；当位深能够明确映射时，也支持 `WAVE_FORMAT_EXTENSIBLE`（`0xFFFE`）。
 
-### Manual Validation
+### 手动验证
 
-1. Start the Windows agent.
-2. Open Notepad on Windows.
-3. Start the Mac controller with the Windows host/IP and port.
-4. Type letters, digits, space, enter, tab, backspace, delete, and arrow keys on the Mac.
-5. Confirm Notepad receives input.
-6. Confirm the active Mac app does not receive duplicate forwarded input.
-7. Press `Control + Option + Escape` and confirm forwarding stops.
+1. 启动 Windows 端代理程序。
+2. 在 Windows 上打开记事本。
+3. 使用 Windows 主机地址或 IP 和端口启动 Mac 控制端。
+4. 在 Mac 上输入字母、数字、空格、回车、制表、退格、删除和方向键。
+5. 确认 Windows 记事本能够收到输入。
+6. 确认 Mac 当前活动的应用程序不会收到重复的转发输入。
+7. 按 `Control + Option + Escape`，确认输入转发停止。
