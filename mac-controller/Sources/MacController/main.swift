@@ -1,7 +1,10 @@
 import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
 import MacBridgeCore
+
+setbuf(stdout, nil)
 
 final class TcpLineSender {
     private var inputStream: InputStream?
@@ -33,6 +36,14 @@ final class TcpLineSender {
         if written != bytes.count {
             throw RuntimeError("failed to send full message")
         }
+    }
+
+    func audioInputStream() throws -> InputStream {
+        guard let inputStream else {
+            throw RuntimeError("TCP input stream is not connected")
+        }
+
+        return inputStream
     }
 }
 
@@ -115,47 +126,157 @@ final class KeyboardForwarder {
     }
 }
 
+struct ControllerOptions {
+    let windowsHost: String
+    let port: Int
+    let keyboardEnabled: Bool
+    let audioEnabled: Bool
+    let audioMode: AudioBridgeMode
+    let volume: Double
+    let muted: Bool
+
+    static func parse(_ args: [String]) -> ControllerOptions? {
+        guard args.count >= 3, let port = Int(args[2]) else {
+            return nil
+        }
+
+        var keyboardEnabled = true
+        var audioEnabled = false
+        var audioMode = AudioBridgeMode.lowLatency
+        var volume = 1.0
+        var muted = false
+        var index = 3
+
+        while index < args.count {
+            switch args[index] {
+            case "--audio":
+                audioEnabled = true
+                index += 1
+            case "--audio-only":
+                keyboardEnabled = false
+                audioEnabled = true
+                index += 1
+            case "--audio-mode":
+                guard index + 1 < args.count,
+                      let mode = AudioBridgeMode(rawValue: args[index + 1]) else {
+                    return nil
+                }
+
+                audioMode = mode
+                index += 2
+            case "--volume":
+                guard index + 1 < args.count,
+                      let parsedVolume = Double(args[index + 1]) else {
+                    return nil
+                }
+
+                volume = min(max(parsedVolume, 0), 1)
+                index += 2
+            case "--muted":
+                muted = true
+                index += 1
+            default:
+                return nil
+            }
+        }
+
+        return ControllerOptions(
+            windowsHost: args[1],
+            port: port,
+            keyboardEnabled: keyboardEnabled,
+            audioEnabled: audioEnabled,
+            audioMode: audioMode,
+            volume: volume,
+            muted: muted
+        )
+    }
+}
+
 let args = CommandLine.arguments
-guard args.count == 3, let port = Int(args[2]) else {
-    print("usage: mac-controller <windows-host> <port>")
+guard let options = ControllerOptions.parse(args) else {
+    print("usage: mac-controller <windows-host> <port> [--audio|--audio-only] [--audio-mode lowLatency|stable] [--volume 0.0-1.0] [--muted]")
     exit(64)
 }
 
-guard AXIsProcessTrusted() else {
+guard !options.keyboardEnabled || AXIsProcessTrusted() else {
     print("missing Accessibility/Input Monitoring permission for keyboard event capture")
     exit(77)
 }
 
 let sender = TcpLineSender()
 do {
-    try sender.connect(host: args[1], port: port)
+    try sender.connect(host: options.windowsHost, port: options.port)
 } catch {
     print("connection failed: \(error)")
     exit(69)
 }
 
-let forwarder = KeyboardForwarder(sender: sender)
-let mask = (1 << CGEventType.keyDown.rawValue)
-    | (1 << CGEventType.keyUp.rawValue)
-    | (1 << CGEventType.flagsChanged.rawValue)
-
-guard let tap = CGEvent.tapCreate(
-    tap: .cgSessionEventTap,
-    place: .headInsertEventTap,
-    options: .defaultTap,
-    eventsOfInterest: CGEventMask(mask),
-    callback: { proxy, type, event, refcon in
-        let forwarder = Unmanaged<KeyboardForwarder>.fromOpaque(refcon!).takeUnretainedValue()
-        return forwarder.handle(proxy: proxy, type: type, event: event)
-    },
-    userInfo: Unmanaged.passUnretained(forwarder).toOpaque()
-) else {
-    print("failed to create CGEventTap")
-    exit(77)
+let audioPlayer: AudioStreamPlayer?
+if options.audioEnabled {
+    do {
+        audioPlayer = try AudioStreamPlayer(
+            inputStream: sender.audioInputStream(),
+            volume: options.volume,
+            muted: options.muted
+        )
+        audioPlayer?.start()
+        try sender.send(AudioControlMessage(
+            enabled: true,
+            mode: options.audioMode,
+            volume: options.volume,
+            muted: options.muted
+        ).jsonLine())
+        print("audio bridge requested mode=\(options.audioMode.rawValue)")
+    } catch {
+        print("audio setup failed: \(error)")
+        exit(69)
+    }
+} else {
+    audioPlayer = nil
 }
 
-let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
-CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
-CGEvent.tapEnable(tap: tap, enable: true)
-print("forwarding keyboard events to \(args[1]):\(port); press Control+Option+Escape to stop")
-CFRunLoopRun()
+if options.keyboardEnabled {
+    let forwarder = KeyboardForwarder(sender: sender)
+    let mask = (1 << CGEventType.keyDown.rawValue)
+        | (1 << CGEventType.keyUp.rawValue)
+        | (1 << CGEventType.flagsChanged.rawValue)
+
+    guard let tap = CGEvent.tapCreate(
+        tap: .cgSessionEventTap,
+        place: .headInsertEventTap,
+        options: .defaultTap,
+        eventsOfInterest: CGEventMask(mask),
+        callback: { proxy, type, event, refcon in
+            let forwarder = Unmanaged<KeyboardForwarder>.fromOpaque(refcon!).takeUnretainedValue()
+            return forwarder.handle(proxy: proxy, type: type, event: event)
+        },
+        userInfo: Unmanaged.passUnretained(forwarder).toOpaque()
+    ) else {
+        print("failed to create CGEventTap")
+        exit(77)
+    }
+
+    let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+    CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+    CGEvent.tapEnable(tap: tap, enable: true)
+    print("forwarding keyboard events to \(options.windowsHost):\(options.port); press Control+Option+Escape to stop")
+    CFRunLoopRun()
+} else {
+    print("audio-only mode connected to \(options.windowsHost):\(options.port); keyboard remains local")
+    CFRunLoopRun()
+}
+
+if options.audioEnabled {
+    do {
+        try sender.send(AudioControlMessage(
+            enabled: false,
+            mode: options.audioMode,
+            volume: options.volume,
+            muted: true
+        ).jsonLine())
+    } catch {
+        print("audio shutdown message failed: \(error)")
+    }
+
+    audioPlayer?.stop()
+}
