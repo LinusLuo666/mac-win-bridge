@@ -62,6 +62,27 @@ dotnet test windows-agent\tests\WindowsAgent.Tests\WindowsAgent.Tests.csproj
 
 The Windows agent starts WASAPI loopback capture only after the Mac controller sends an `audioControl` message. Captured system output is streamed back over the same TCP connection as length-prefixed PCM frames.
 
+Windows management commands:
+
+```powershell
+# Foreground: keep this terminal open; Ctrl+C stops the agent.
+.\scripts\start-windows-agent.ps1 -Action Foreground -Port 5055
+
+# Persistent background process with logs under %LOCALAPPDATA%\MacWinBridge.
+.\scripts\start-windows-agent.ps1 -Action Start -Port 5055
+
+# Show the managed PID plus LISTENING and ESTABLISHED sockets.
+.\scripts\start-windows-agent.ps1 -Action Status -Port 5055
+
+# Tail recent stdout and stderr.
+.\scripts\start-windows-agent.ps1 -Action Logs -Tail 200
+
+# Stop the managed listener and verify that port 5055 is released.
+.\scripts\start-windows-agent.ps1 -Action Stop -Port 5055
+```
+
+The default action remains `Foreground`, so `.\scripts\start-windows-agent.ps1 -Port 5055` continues to work. Background management is local to Windows and does not require the Mac client to be running.
+
 Manual startup order:
 
 1. On Windows, open PowerShell in the repo and run `.\scripts\start-windows-agent.ps1 -Port 5055`.
