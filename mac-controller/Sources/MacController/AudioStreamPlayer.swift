@@ -9,6 +9,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private let onTermination: @Sendable (Error?) -> Void
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
+    private let bufferQueueLimiter = AudioBufferQueueLimiter(maximumPendingBuffers: 1)
     private let stateLock = NSLock()
     private var worker: Thread?
     private var running = true
@@ -43,6 +44,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
         stateLock.lock()
         running = false
         stateLock.unlock()
+        bufferQueueLimiter.stop()
         playerNode.stop()
         engine.stop()
     }
@@ -67,7 +69,12 @@ final class AudioStreamPlayer: @unchecked Sendable {
                     throw RuntimeError("failed to create PCM playback buffer")
                 }
 
-                playerNode.scheduleBuffer(buffer)
+                guard bufferQueueLimiter.waitForSlot() else {
+                    break
+                }
+                playerNode.scheduleBuffer(buffer) { [weak self] in
+                    self?.bufferQueueLimiter.release()
+                }
                 record(frame: frame)
             }
         } catch {

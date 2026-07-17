@@ -165,6 +165,14 @@ let tests: [(String, () throws -> Void)] = [
         }
         try expectEqual(result, Data(source), "joined bytes")
     }),
+    ("AudioBufferQueueLimiter permits only one unplayed buffer", {
+        let limiter = AudioBufferQueueLimiter(maximumPendingBuffers: 1)
+
+        try expectTrue(limiter.tryReserve(), "first buffer should be accepted")
+        try expectFalse(limiter.tryReserve(), "second buffer must wait for the first to play")
+        limiter.release()
+        try expectTrue(limiter.tryReserve(), "a completed buffer frees the only slot")
+    }),
     ("ReconnectBackoff grows and caps delay", {
         var backoff = ReconnectBackoff(maximumDelay: 10)
         try expectEqual(backoff.nextDelay(), 1, "first delay")
