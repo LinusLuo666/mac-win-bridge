@@ -5,6 +5,27 @@ struct TestFailure: Error, CustomStringConvertible {
     let description: String
 }
 
+final class ThreadSafeBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+
+    func set(_ newValue: Value) {
+        lock.lock()
+        value = newValue
+        lock.unlock()
+    }
+
+    func get() -> Value {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+
 func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String) throws {
     if actual != expected {
         throw TestFailure(description: "\(message): expected \(expected), got \(actual)")
@@ -172,6 +193,31 @@ let tests: [(String, () throws -> Void)] = [
         try expectFalse(limiter.tryReserve(), "second buffer must wait for the first to play")
         limiter.release()
         try expectTrue(limiter.tryReserve(), "a completed buffer frees the only slot")
+    }),
+    ("LatestFrameBuffer keeps only the newest frame", {
+        let buffer = LatestFrameBuffer<String>()
+
+        try expectEqual(buffer.put("A"), .stored, "A result")
+        try expectEqual(buffer.put("B"), .replaced, "B replaces A")
+        try expectEqual(buffer.put("C"), .replaced, "C replaces B")
+        try expectEqual(buffer.waitForLatest(), "C", "newest frame")
+    }),
+    ("LatestFrameBuffer stop wakes an empty waiter", {
+        let buffer = LatestFrameBuffer<String>()
+        let started = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let result = ThreadSafeBox<String?>(nil)
+
+        Thread {
+            started.signal()
+            result.set(buffer.waitForLatest())
+            finished.signal()
+        }.start()
+
+        try expectEqual(started.wait(timeout: .now() + 1), .success, "waiter started")
+        buffer.stop()
+        try expectEqual(finished.wait(timeout: .now() + 1), .success, "waiter finished")
+        try expectNil(result.get(), "stopped wait result")
     }),
     ("ReconnectBackoff grows and caps delay", {
         var backoff = ReconnectBackoff(maximumDelay: 10)
