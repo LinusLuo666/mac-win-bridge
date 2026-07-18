@@ -246,20 +246,20 @@ func runAudioOnly(options: ControllerOptions) -> Never {
                 muted: options.muted,
                 onTermination: { error in
                     if let error {
-                        print("audio connection ended: \(error)")
+                        AudioRuntimeLog.write("audio connection ended: \(error)")
                     } else {
-                        print("audio connection closed by Windows")
+                        AudioRuntimeLog.write("audio connection closed by Windows")
                     }
                     disconnected.signal()
                 }
             )
             player?.start()
             try sender.send(audioControlMessage(options: options, enabled: true))
-            print("audio bridge requested mode=\(options.audioMode.rawValue)")
-            print("audio-only mode connected to \(options.windowsHost):\(options.port); keyboard remains local")
+            AudioRuntimeLog.write("audio bridge requested mode=\(options.audioMode.rawValue)")
+            AudioRuntimeLog.write("audio-only mode connected to \(options.windowsHost):\(options.port); keyboard remains local")
             disconnected.wait()
         } catch {
-            print("audio-only connection failed: \(error)")
+            AudioRuntimeLog.write("audio-only connection failed: \(error)")
         }
 
         player?.stop()
@@ -269,7 +269,7 @@ func runAudioOnly(options: ControllerOptions) -> Never {
             backoff.reset()
         }
         let delay = backoff.nextDelay()
-        print(String(format: "reconnecting to %@:%d in %.0f seconds", options.windowsHost, options.port, delay))
+        AudioRuntimeLog.write(String(format: "reconnecting to %@:%d in %.0f seconds", options.windowsHost, options.port, delay))
         Thread.sleep(forTimeInterval: delay)
     }
 }
@@ -306,16 +306,16 @@ if options.audioEnabled {
             muted: options.muted,
             onTermination: { error in
                 if let error {
-                    print("audio connection ended: \(error)")
+                    AudioRuntimeLog.write("audio connection ended: \(error)")
                 }
                 CFRunLoopStop(CFRunLoopGetMain())
             }
         )
         audioPlayer?.start()
         try sender.send(audioControlMessage(options: options, enabled: true))
-        print("audio bridge requested mode=\(options.audioMode.rawValue)")
+        AudioRuntimeLog.write("audio bridge requested mode=\(options.audioMode.rawValue)")
     } catch {
-        print("audio setup failed: \(error)")
+        AudioRuntimeLog.write("audio setup failed: \(error)")
         exit(69)
     }
 } else {
@@ -354,7 +354,7 @@ if options.audioEnabled {
     do {
         try sender.send(audioControlMessage(options: options, enabled: false))
     } catch {
-        print("audio shutdown message failed: \(error)")
+        AudioRuntimeLog.write("audio shutdown message failed: \(error)")
     }
 
     audioPlayer?.stop()

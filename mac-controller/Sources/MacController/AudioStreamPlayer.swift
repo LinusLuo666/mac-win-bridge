@@ -2,6 +2,21 @@ import AVFoundation
 import Foundation
 import MacBridgeCore
 
+private struct AudioPipelineTotals {
+    let receivedInputBuffers: Int
+    let receivedInputSampleFrames: Int
+    let overwrittenInputBuffers: Int
+    let overwrittenInputSampleFrames: Int
+    let reblockedOutputBuffers: Int
+    let reblockedOutputSampleFrames: Int
+    let scheduledOutputBuffers: Int
+    let scheduledOutputSampleFrames: Int
+    let completedOutputBuffers: Int
+    let completedOutputSampleFrames: Int
+    let carrySampleFrames: Int
+    let qpcJumps: Int
+}
+
 final class AudioStreamPlayer: @unchecked Sendable {
     private let inputStream: InputStream
     private let volume: Float
@@ -10,23 +25,40 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
     private let latestFrameBuffer = LatestFrameBuffer<WindowsAudioFrame>()
-    private let bufferQueueLimiter = AudioBufferQueueLimiter(maximumPendingBuffers: 1)
+    private let bufferQueueLimiter = AudioBufferQueueLimiter(maximumPendingBuffers: 2)
+    private let reblocker = PCMReblocker()
     private let stateLock = NSLock()
     private let statisticsLock = NSLock()
+    private let evidenceQueue = DispatchQueue(
+        label: "AudioStreamEvidence",
+        qos: .utility
+    )
     private var receiverWorker: Thread?
     private var playbackWorker: Thread?
+    private var evidenceTimer: DispatchSourceTimer?
     private var running = true
     private var terminationReported = false
     private var playbackFormat: AVAudioFormat?
     private var sourceMetadata: WindowsAudioMetadata?
-    private var receivedFrames = 0
-    private var droppedFrames = 0
-    private var scheduledFrames = 0
+    private var receivedInputBuffers = 0
+    private var receivedInputSampleFrames = 0
+    private var overwrittenInputBuffers = 0
+    private var overwrittenInputSampleFrames = 0
+    private var reblockedOutputBuffers = 0
+    private var reblockedOutputSampleFrames = 0
+    private var scheduledOutputBuffers = 0
+    private var scheduledOutputSampleFrames = 0
+    private var completedOutputBuffers = 0
+    private var completedOutputSampleFrames = 0
+    private var carrySampleFrames = 0
     private var qpcJumps = 0
-    private var receivedPcmBytes = 0
     private var qpcJumpTracker = AudioQPCJumpTracker()
     private var statisticsStartedAt: Date?
     private var nextStatisticsLogAt = 5.0
+    private var evidenceWindowTracker: AudioPipelineEvidenceWindowTracker
+    private var nextEvidenceWindowEnd: Date
+    private var arrivalBatchTracker = AudioArrivalBatchTracker()
+    private var loggedTemporaryZeroRead = false
 
     init(
         inputStream: InputStream,
@@ -38,9 +70,21 @@ final class AudioStreamPlayer: @unchecked Sendable {
         self.volume = Float(min(max(volume, 0), 1))
         self.muted = muted
         self.onTermination = onTermination
+        let evidenceWindow = AudioEvidenceClock.alignedWindow(
+            containing: Date(),
+            duration: 5
+        )
+        evidenceWindowTracker = AudioPipelineEvidenceWindowTracker(
+            windowStart: evidenceWindow.start
+        )
+        nextEvidenceWindowEnd = evidenceWindow.end
     }
 
     func start() {
+        AudioRuntimeLog.write(
+            "audio input stream before receiver status=\(inputStream.streamStatus.rawValue) error=\(inputStream.streamError.map(String.init(describing:)) ?? "none")"
+        )
+        startEvidenceLogging()
         playbackWorker = Thread { [weak self] in
             self?.playbackLoop()
         }
@@ -59,8 +103,11 @@ final class AudioStreamPlayer: @unchecked Sendable {
         running = false
         terminationReported = true
         stateLock.unlock()
+        stopEvidenceLogging()
+        flushArrivalBatch()
         latestFrameBuffer.stop()
         bufferQueueLimiter.stop()
+        reblocker.stop()
         playerNode.stop()
         engine.stop()
     }
@@ -78,16 +125,16 @@ final class AudioStreamPlayer: @unchecked Sendable {
                 }
 
                 let frame = try WindowsAudioFrameProtocol.parse(payload: payload)
-                let putResult = latestFrameBuffer.put(frame)
-                recordReceived(frame: frame, putResult: putResult)
-                if putResult == .stopped {
+                let putOutcome = latestFrameBuffer.putReturningReplaced(frame)
+                recordReceived(frame: frame, putOutcome: putOutcome)
+                if putOutcome.result == .stopped {
                     break receiveFrames
                 }
             }
         } catch {
             terminationError = error
             if shouldRun {
-                print("audio receive failed: \(error)")
+                AudioRuntimeLog.write("audio receive failed: \(error)")
             }
         }
         finish(error: terminationError)
@@ -95,31 +142,34 @@ final class AudioStreamPlayer: @unchecked Sendable {
 
     private func playbackLoop() {
         do {
-            while shouldRun && bufferQueueLimiter.waitForSlot() {
+            while shouldRun {
                 guard let frame = latestFrameBuffer.waitForLatest() else {
-                    bufferQueueLimiter.release()
                     break
                 }
 
-                do {
-                    try configurePlaybackIfNeeded(for: frame.metadata)
-                    guard let playbackFormat,
-                          let buffer = makeBuffer(frame: frame, playbackFormat: playbackFormat) else {
-                        throw RuntimeError("failed to create PCM playback buffer")
+                try configurePlaybackIfNeeded(for: frame.metadata)
+                let outputs = try reblocker.append(decodeInputBlock(frame: frame))
+                recordReblocked(outputs: outputs, carrySampleFrames: reblocker.carrySampleFrames)
+
+                for output in outputs {
+                    guard bufferQueueLimiter.waitForSlot() else {
+                        return
                     }
 
-                    playerNode.scheduleBuffer(buffer) { [weak self] in
-                        self?.bufferQueueLimiter.release()
+                    let outputSampleFrames = Int(output.buffer.frameLength)
+                    playerNode.scheduleBuffer(output.buffer) { [weak self] in
+                        guard let self else {
+                            return
+                        }
+                        bufferQueueLimiter.release()
+                        recordCompleted(outputSampleFrames: outputSampleFrames)
                     }
-                    recordScheduled(frame: frame)
-                } catch {
-                    bufferQueueLimiter.release()
-                    throw error
+                    recordScheduled(output: output)
                 }
             }
         } catch {
             if shouldRun {
-                print("audio playback failed: \(error)")
+                AudioRuntimeLog.write("audio playback failed: \(error)")
             }
             finish(error: error)
         }
@@ -132,8 +182,11 @@ final class AudioStreamPlayer: @unchecked Sendable {
         terminationReported = true
         stateLock.unlock()
 
+        stopEvidenceLogging()
+        flushArrivalBatch()
         latestFrameBuffer.stop()
         bufferQueueLimiter.stop()
+        reblocker.stop()
         if shouldNotify {
             onTermination(error)
         }
@@ -174,7 +227,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
         try engine.start()
         playerNode.play()
 
-        print(
+        AudioRuntimeLog.write(
             String(
                 format: "audio first frame sampleRate=%d channels=%d bitsPerSample=%d formatTag=0x%04X blockAlign=%d frameCount=%d qpcPosition=%llu encoding=%@ pcmBytes=%d",
                 metadata.sampleRate,
@@ -188,37 +241,38 @@ final class AudioStreamPlayer: @unchecked Sendable {
                 metadata.frameCount * metadata.blockAlign
             )
         )
-        print(
+        AudioRuntimeLog.write(
             "audio engine running=\(engine.isRunning) playerNode playing=\(playerNode.isPlaying) outputVolume=\(engine.mainMixerNode.outputVolume)"
         )
     }
 
-    private func makeBuffer(frame: WindowsAudioFrame, playbackFormat: AVAudioFormat) -> AVAudioPCMBuffer? {
+    private func decodeInputBlock(frame: WindowsAudioFrame) throws -> PCMInputBlock {
         let metadata = frame.metadata
-        guard let encoding = metadata.encoding,
-              metadata.frameCount > 0,
-              let buffer = AVAudioPCMBuffer(
-                pcmFormat: playbackFormat,
-                frameCapacity: AVAudioFrameCount(metadata.frameCount)
-              ),
-              let channelData = buffer.floatChannelData else {
-            return nil
+        guard let encoding = metadata.encoding, metadata.frameCount > 0 else {
+            throw RuntimeError("failed to decode PCM input frame")
         }
 
-        buffer.frameLength = AVAudioFrameCount(metadata.frameCount)
+        var channels = Array(
+            repeating: [Float](repeating: 0, count: metadata.frameCount),
+            count: metadata.channels
+        )
         let bytesPerSample = metadata.bitsPerSample / 8
         for frameIndex in 0..<metadata.frameCount {
             let frameOffset = frameIndex * metadata.blockAlign
             for channelIndex in 0..<metadata.channels {
                 let sampleOffset = frameOffset + channelIndex * bytesPerSample
-                channelData[channelIndex][frameIndex] = sampleValue(
+                channels[channelIndex][frameIndex] = sampleValue(
                     data: frame.pcm,
                     offset: sampleOffset,
                     encoding: encoding
                 )
             }
         }
-        return buffer
+        return PCMInputBlock(
+            sampleRate: metadata.sampleRate,
+            qpcPosition: metadata.qpcPosition,
+            channels: channels
+        )
     }
 
     private func sampleValue(data: Data, offset: Int, encoding: WindowsAudioEncoding) -> Float {
@@ -250,50 +304,19 @@ final class AudioStreamPlayer: @unchecked Sendable {
             | (UInt32(data[offset + 3]) << 24)
     }
 
-    private func recordReceived(frame: WindowsAudioFrame, putResult: LatestFramePutResult) {
+    private func recordReceived(
+        frame: WindowsAudioFrame,
+        putOutcome: LatestFramePutOutcome<WindowsAudioFrame>
+    ) {
+        let receivedAt = Date()
+        let overwrittenSampleFrames = putOutcome.replaced?.metadata.frameCount ?? 0
         statisticsLock.lock()
-        receivedFrames += 1
-        receivedPcmBytes += frame.pcm.count
-        if putResult == .replaced {
-            droppedFrames += 1
+        receivedInputBuffers += 1
+        receivedInputSampleFrames += frame.metadata.frameCount
+        if overwrittenSampleFrames > 0 {
+            overwrittenInputBuffers += 1
+            overwrittenInputSampleFrames += overwrittenSampleFrames
         }
-        if statisticsStartedAt == nil {
-            statisticsStartedAt = Date()
-        }
-        let elapsed = Date().timeIntervalSince(statisticsStartedAt ?? Date())
-        let shouldLog = elapsed >= nextStatisticsLogAt
-        if shouldLog {
-            nextStatisticsLogAt += 5
-        }
-        let snapshot = (
-            receivedFrames,
-            droppedFrames,
-            scheduledFrames,
-            qpcJumps,
-            receivedPcmBytes
-        )
-        statisticsLock.unlock()
-
-        if shouldLog {
-            print(
-                String(
-                    format: "audio stats elapsed=%.1fs receivedFrames=%d droppedFrames=%d scheduledFrames=%d qpcJumps=%d pcmBytes=%d engineRunning=%@ playerPlaying=%@",
-                    elapsed,
-                    snapshot.0,
-                    snapshot.1,
-                    snapshot.2,
-                    snapshot.3,
-                    snapshot.4,
-                    engine.isRunning.description,
-                    playerNode.isPlaying.description
-                )
-            )
-        }
-    }
-
-    private func recordScheduled(frame: WindowsAudioFrame) {
-        statisticsLock.lock()
-        scheduledFrames += 1
         let jump = qpcJumpTracker.record(
             position: frame.metadata.qpcPosition,
             frameCount: frame.metadata.frameCount,
@@ -302,15 +325,193 @@ final class AudioStreamPlayer: @unchecked Sendable {
         if jump != nil {
             qpcJumps += 1
         }
-        let droppedSnapshot = droppedFrames
+        evidenceWindowTracker.recordInput(
+            sampleFrameCount: frame.metadata.frameCount,
+            overwrittenSampleFrameCount: overwrittenSampleFrames,
+            qpcJumpActualDelta: jump?.actualDelta,
+            at: receivedAt
+        )
+        let batch = arrivalBatchTracker.record(
+            at: receivedAt,
+            expectedInterval: Double(frame.metadata.frameCount) / Double(frame.metadata.sampleRate),
+            dropped: overwrittenSampleFrames > 0
+        )
+        if statisticsStartedAt == nil {
+            statisticsStartedAt = Date()
+        }
+        let elapsed = Date().timeIntervalSince(statisticsStartedAt ?? Date())
+        let shouldLog = elapsed >= nextStatisticsLogAt
+        if shouldLog {
+            nextStatisticsLogAt += 5
+        }
+        let snapshot = pipelineTotalsLocked()
         statisticsLock.unlock()
 
         if let jump {
-            let actualDelta = jump.actualDelta.map { String($0) } ?? "n/a"
-            print(
-                "audio qpc jump direction=\(jump.direction.rawValue) previous=\(jump.previousPosition) current=\(jump.currentPosition) actualDelta=\(actualDelta) expectedDelta=\(jump.expectedDelta) droppedFrames=\(droppedSnapshot)"
+            let actualDelta = jump.actualDelta.map(String.init) ?? "n/a"
+            AudioRuntimeLog.write(
+                "audio input qpc jump direction=\(jump.direction.rawValue) previous=\(jump.previousPosition) current=\(jump.currentPosition) actualDelta=\(actualDelta) expectedDelta=\(jump.expectedDelta)"
             )
         }
+        if let batch {
+            logArrivalBatch(batch)
+        }
+
+        if shouldLog {
+            AudioRuntimeLog.write(
+                String(
+                    format: "audio stats elapsed=%.1fs receivedInputBuffers=%d receivedInputSampleFrames=%d overwrittenInputBuffers=%d overwrittenInputSampleFrames=%d reblockedOutputBuffers=%d reblockedOutputSampleFrames=%d scheduledOutputBuffers=%d scheduledOutputSampleFrames=%d completedOutputBuffers=%d completedOutputSampleFrames=%d carrySampleFrames=%d qpcJumps=%d engineRunning=%@ playerPlaying=%@",
+                    elapsed,
+                    snapshot.receivedInputBuffers,
+                    snapshot.receivedInputSampleFrames,
+                    snapshot.overwrittenInputBuffers,
+                    snapshot.overwrittenInputSampleFrames,
+                    snapshot.reblockedOutputBuffers,
+                    snapshot.reblockedOutputSampleFrames,
+                    snapshot.scheduledOutputBuffers,
+                    snapshot.scheduledOutputSampleFrames,
+                    snapshot.completedOutputBuffers,
+                    snapshot.completedOutputSampleFrames,
+                    snapshot.carrySampleFrames,
+                    snapshot.qpcJumps,
+                    engine.isRunning.description,
+                    playerNode.isPlaying.description
+                )
+            )
+        }
+    }
+
+    private func recordReblocked(outputs: [ReblockedPCMOutput], carrySampleFrames: Int) {
+        statisticsLock.lock()
+        self.carrySampleFrames = carrySampleFrames
+        evidenceWindowTracker.updateCarry(sampleFrameCount: carrySampleFrames)
+        for output in outputs {
+            let sampleFrames = Int(output.buffer.frameLength)
+            reblockedOutputBuffers += 1
+            reblockedOutputSampleFrames += sampleFrames
+            evidenceWindowTracker.recordReblocked(
+                outputSampleFrameCount: sampleFrames,
+                startQPCPosition: output.startQPCPosition,
+                endQPCPosition: outputEndQPCPosition(output),
+                sourceSpanCount: output.sourceSpans.count
+            )
+        }
+        statisticsLock.unlock()
+    }
+
+    private func recordScheduled(output: ReblockedPCMOutput) {
+        let sampleFrames = Int(output.buffer.frameLength)
+        statisticsLock.lock()
+        scheduledOutputBuffers += 1
+        scheduledOutputSampleFrames += sampleFrames
+        evidenceWindowTracker.recordScheduled(outputSampleFrameCount: sampleFrames)
+        statisticsLock.unlock()
+    }
+
+    private func recordCompleted(outputSampleFrames: Int) {
+        statisticsLock.lock()
+        completedOutputBuffers += 1
+        completedOutputSampleFrames += outputSampleFrames
+        evidenceWindowTracker.recordCompleted(outputSampleFrameCount: outputSampleFrames)
+        statisticsLock.unlock()
+    }
+
+    private func outputEndQPCPosition(_ output: ReblockedPCMOutput) -> UInt64 {
+        guard let metadata = sourceMetadata, let lastSpan = output.sourceSpans.last else {
+            return output.startQPCPosition
+        }
+        let sourceEndOffset = lastSpan.sourceFrameOffset + lastSpan.sampleFrameCount
+        let qpcOffset = Double(sourceEndOffset) * 10_000_000 / Double(metadata.sampleRate)
+        return lastSpan.qpcPosition + UInt64(qpcOffset.rounded())
+    }
+
+    private func pipelineTotalsLocked() -> AudioPipelineTotals {
+        AudioPipelineTotals(
+            receivedInputBuffers: receivedInputBuffers,
+            receivedInputSampleFrames: receivedInputSampleFrames,
+            overwrittenInputBuffers: overwrittenInputBuffers,
+            overwrittenInputSampleFrames: overwrittenInputSampleFrames,
+            reblockedOutputBuffers: reblockedOutputBuffers,
+            reblockedOutputSampleFrames: reblockedOutputSampleFrames,
+            scheduledOutputBuffers: scheduledOutputBuffers,
+            scheduledOutputSampleFrames: scheduledOutputSampleFrames,
+            completedOutputBuffers: completedOutputBuffers,
+            completedOutputSampleFrames: completedOutputSampleFrames,
+            carrySampleFrames: carrySampleFrames,
+            qpcJumps: qpcJumps
+        )
+    }
+
+    private func startEvidenceLogging() {
+        let now = Date()
+        let delay = max(0, nextEvidenceWindowEnd.timeIntervalSince(now))
+        let timer = DispatchSource.makeTimerSource(queue: evidenceQueue)
+        timer.schedule(
+            deadline: .now() + delay,
+            repeating: 5,
+            leeway: .milliseconds(20)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.logEvidenceWindows(through: Date())
+        }
+
+        stateLock.lock()
+        evidenceTimer = timer
+        stateLock.unlock()
+        timer.resume()
+    }
+
+    private func stopEvidenceLogging() {
+        stateLock.lock()
+        let timer = evidenceTimer
+        evidenceTimer = nil
+        stateLock.unlock()
+        timer?.cancel()
+    }
+
+    private func logEvidenceWindows(through date: Date) {
+        var records: [(AudioPipelineEvidenceWindowSnapshot, AudioPipelineTotals)] = []
+
+        statisticsLock.lock()
+        while nextEvidenceWindowEnd <= date {
+            let snapshot = evidenceWindowTracker.snapshotAndReset(
+                windowEnd: nextEvidenceWindowEnd
+            )
+            let totals = pipelineTotalsLocked()
+            records.append((snapshot, totals))
+            nextEvidenceWindowEnd = nextEvidenceWindowEnd.addingTimeInterval(5)
+        }
+        statisticsLock.unlock()
+
+        for (snapshot, totals) in records {
+            let frameCounts = snapshot.inputFrameCountDistribution
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key):\($0.value)" }
+                .joined(separator: ",")
+            let maximumQpcDelta = snapshot.maximumQpcDelta.map(String.init) ?? "none"
+            let firstOutputQPC = snapshot.firstOutputStartQPCPosition.map(String.init) ?? "none"
+            let lastOutputQPC = snapshot.lastOutputEndQPCPosition.map(String.init) ?? "none"
+            AudioRuntimeLog.write(
+                "audio evidence window start=\(AudioEvidenceClock.timestamp(snapshot.start)) end=\(AudioEvidenceClock.timestamp(snapshot.end)) receivedInputBuffers=\(snapshot.receivedInputBuffers) receivedInputSampleFrames=\(snapshot.receivedInputSampleFrames) overwrittenInputBuffers=\(snapshot.overwrittenInputBuffers) overwrittenInputSampleFrames=\(snapshot.overwrittenInputSampleFrames) reblockedOutputBuffers=\(snapshot.reblockedOutputBuffers) reblockedOutputSampleFrames=\(snapshot.reblockedOutputSampleFrames) scheduledOutputBuffers=\(snapshot.scheduledOutputBuffers) scheduledOutputSampleFrames=\(snapshot.scheduledOutputSampleFrames) completedOutputBuffers=\(snapshot.completedOutputBuffers) completedOutputSampleFrames=\(snapshot.completedOutputSampleFrames) carrySampleFrames=\(snapshot.carrySampleFrames) inputFrameCounts=\(frameCounts.isEmpty ? "none" : frameCounts) qpcJumps=\(snapshot.qpcJumps) maxQpcDelta=\(maximumQpcDelta) maxArrivalGapMs=\(snapshot.maximumArrivalGapMilliseconds) outputSourceSpanCount=\(snapshot.outputSourceSpanCount) firstOutputStartQPC=\(firstOutputQPC) lastOutputEndQPC=\(lastOutputQPC) totalReceivedInputBuffers=\(totals.receivedInputBuffers) totalReceivedInputSampleFrames=\(totals.receivedInputSampleFrames) totalOverwrittenInputBuffers=\(totals.overwrittenInputBuffers) totalOverwrittenInputSampleFrames=\(totals.overwrittenInputSampleFrames) totalReblockedOutputBuffers=\(totals.reblockedOutputBuffers) totalReblockedOutputSampleFrames=\(totals.reblockedOutputSampleFrames) totalScheduledOutputBuffers=\(totals.scheduledOutputBuffers) totalScheduledOutputSampleFrames=\(totals.scheduledOutputSampleFrames) totalCompletedOutputBuffers=\(totals.completedOutputBuffers) totalCompletedOutputSampleFrames=\(totals.completedOutputSampleFrames) totalCarrySampleFrames=\(totals.carrySampleFrames) totalQpcJumps=\(totals.qpcJumps) engineRunning=\(engine.isRunning) playerPlaying=\(playerNode.isPlaying)",
+                at: snapshot.end
+            )
+        }
+    }
+
+    private func flushArrivalBatch() {
+        statisticsLock.lock()
+        let batch = arrivalBatchTracker.finish()
+        statisticsLock.unlock()
+        if let batch {
+            logArrivalBatch(batch)
+        }
+    }
+
+    private func logArrivalBatch(_ batch: AudioArrivalBatch) {
+        AudioRuntimeLog.write(
+            "audio arrival batch start=\(AudioEvidenceClock.timestamp(batch.start)) end=\(AudioEvidenceClock.timestamp(batch.end)) receivedInputBuffers=\(batch.receivedFrames) overwrittenInputBuffers=\(batch.droppedFrames) engineRunning=\(engine.isRunning) playerPlaying=\(playerNode.isPlaying)",
+            at: batch.end
+        )
     }
 
     private var shouldRun: Bool {
@@ -320,12 +521,24 @@ final class AudioStreamPlayer: @unchecked Sendable {
     }
 
     private func readExactly(byteCount: Int) throws -> Data? {
-        try ExactByteReader.read(byteCount: byteCount) { pointer, maximumLength in
-            let count = inputStream.read(pointer, maxLength: maximumLength)
-            if count < 0 {
-                throw inputStream.streamError ?? RuntimeError("audio stream read failed")
+        try ExactByteReader.read(
+            byteCount: byteCount,
+            from: inputStream,
+            onZeroRead: { [weak self] status, error, offset in
+                guard let self else {
+                    return
+                }
+                let temporary = status == .open || status == .opening || status == .reading
+                if temporary {
+                    guard !loggedTemporaryZeroRead else {
+                        return
+                    }
+                    loggedTemporaryZeroRead = true
+                }
+                AudioRuntimeLog.write(
+                    "audio input zero read status=\(status.rawValue) offset=\(offset) error=\(error.map(String.init(describing:)) ?? "none")"
+                )
             }
-            return count
-        }
+        )
     }
 }

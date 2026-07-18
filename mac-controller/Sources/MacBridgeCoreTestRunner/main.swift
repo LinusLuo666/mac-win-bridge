@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import MacBridgeCore
 
@@ -26,6 +27,56 @@ final class ThreadSafeBox<Value>: @unchecked Sendable {
     }
 }
 
+final class ScriptedInputStream: InputStream {
+    enum Step {
+        case bytes([UInt8])
+        case zero(Stream.Status, Error? = nil)
+    }
+
+    private var steps: [Step]
+    private var reportedStatus: Stream.Status = .open
+    private var reportedError: Error?
+
+    init(steps: [Step]) {
+        self.steps = steps
+        super.init(data: Data())
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var streamStatus: Stream.Status {
+        reportedStatus
+    }
+
+    override var streamError: Error? {
+        reportedError
+    }
+
+    override func read(_ buffer: UnsafeMutablePointer<UInt8>, maxLength len: Int) -> Int {
+        guard !steps.isEmpty else {
+            reportedStatus = .atEnd
+            return 0
+        }
+
+        switch steps.removeFirst() {
+        case .bytes(let bytes):
+            reportedStatus = .open
+            reportedError = nil
+            let count = min(bytes.count, len)
+            for index in 0..<count {
+                buffer[index] = bytes[index]
+            }
+            return count
+        case .zero(let status, let error):
+            reportedStatus = status
+            reportedError = error
+            return 0
+        }
+    }
+}
+
 func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String) throws {
     if actual != expected {
         throw TestFailure(description: "\(message): expected \(expected), got \(actual)")
@@ -48,6 +99,18 @@ func expectFalse(_ actual: Bool, _ message: String) throws {
     if actual {
         throw TestFailure(description: "\(message): expected false")
     }
+}
+
+func pcmSamples(_ buffer: AVAudioPCMBuffer, channel: Int) throws -> [Float] {
+    guard let channelData = buffer.floatChannelData else {
+        throw TestFailure(description: "PCM buffer has no float channel data")
+    }
+    return Array(
+        UnsafeBufferPointer(
+            start: channelData[channel],
+            count: Int(buffer.frameLength)
+        )
+    )
 }
 
 func appendUInt16LE(_ value: UInt16, to data: inout Data) {
@@ -186,6 +249,69 @@ let tests: [(String, () throws -> Void)] = [
         }
         try expectEqual(result, Data(source), "joined bytes")
     }),
+    ("ExactByteReader retries a zero-byte read while InputStream remains open", {
+        let stream = ScriptedInputStream(steps: [
+            .zero(.open),
+            .bytes([1, 2, 3])
+        ])
+        var observedStatuses: [Stream.Status] = []
+
+        let result = try ExactByteReader.read(
+            byteCount: 3,
+            from: stream,
+            retryDelay: 0,
+            onZeroRead: { status, _, _ in
+                observedStatuses.append(status)
+            }
+        )
+
+        try expectEqual(result, Data([1, 2, 3]), "bytes after temporary zero read")
+        try expectEqual(observedStatuses, [.open], "observed temporary stream status")
+    }),
+    ("ExactByteReader treats zero bytes at InputStream end as EOF", {
+        let stream = ScriptedInputStream(steps: [.zero(.atEnd)])
+
+        let result = try ExactByteReader.read(
+            byteCount: 3,
+            from: stream,
+            retryDelay: 0
+        )
+
+        try expectNil(result, "at-end read result")
+    }),
+    ("ExactByteReader reports truncated data when InputStream ends after partial bytes", {
+        let stream = ScriptedInputStream(steps: [
+            .bytes([1, 2]),
+            .zero(.atEnd)
+        ])
+
+        do {
+            _ = try ExactByteReader.read(
+                byteCount: 3,
+                from: stream,
+                retryDelay: 0
+            )
+            throw TestFailure(description: "expected truncated stream error")
+        } catch let error as ExactByteReaderError {
+            try expectEqual(error, .truncated(expected: 3, actual: 2), "truncated stream error")
+        }
+    }),
+    ("ExactByteReader throws InputStream error status", {
+        let expectedError = NSError(domain: "ExactByteReaderTests", code: 91)
+        let stream = ScriptedInputStream(steps: [.zero(.error, expectedError)])
+
+        do {
+            _ = try ExactByteReader.read(
+                byteCount: 3,
+                from: stream,
+                retryDelay: 0
+            )
+            throw TestFailure(description: "expected InputStream error")
+        } catch let error as NSError {
+            try expectEqual(error.domain, expectedError.domain, "stream error domain")
+            try expectEqual(error.code, expectedError.code, "stream error code")
+        }
+    }),
     ("AudioBufferQueueLimiter permits only one unplayed buffer", {
         let limiter = AudioBufferQueueLimiter(maximumPendingBuffers: 1)
 
@@ -194,6 +320,174 @@ let tests: [(String, () throws -> Void)] = [
         limiter.release()
         try expectTrue(limiter.tryReserve(), "a completed buffer frees the only slot")
     }),
+    ("AudioBufferQueueLimiter capacity two blocks a third buffer until release", {
+        let limiter = AudioBufferQueueLimiter(maximumPendingBuffers: 2)
+        let waiterStarted = DispatchSemaphore(value: 0)
+        let waiterFinished = DispatchSemaphore(value: 0)
+        let waiterResult = ThreadSafeBox(false)
+
+        try expectTrue(limiter.tryReserve(), "first buffer should be accepted")
+        try expectTrue(limiter.tryReserve(), "second buffer should be accepted")
+
+        Thread {
+            waiterStarted.signal()
+            waiterResult.set(limiter.waitForSlot())
+            waiterFinished.signal()
+        }.start()
+
+        try expectEqual(waiterStarted.wait(timeout: .now() + 1), .success, "third waiter started")
+        try expectEqual(
+            waiterFinished.wait(timeout: .now() + 0.05),
+            .timedOut,
+            "third buffer must wait while both slots are occupied"
+        )
+
+        limiter.release()
+        try expectEqual(
+            waiterFinished.wait(timeout: .now() + 1),
+            .success,
+            "releasing one buffer should admit the waiting buffer"
+        )
+        try expectTrue(waiterResult.get(), "third buffer reservation should succeed after release")
+    }),
+    ("AudioBufferQueueLimiter stop wakes a capacity two waiter", {
+        let limiter = AudioBufferQueueLimiter(maximumPendingBuffers: 2)
+        let waiterStarted = DispatchSemaphore(value: 0)
+        let waiterFinished = DispatchSemaphore(value: 0)
+        let waiterResult = ThreadSafeBox(true)
+
+        try expectTrue(limiter.tryReserve(), "first buffer should be accepted")
+        try expectTrue(limiter.tryReserve(), "second buffer should be accepted")
+
+        Thread {
+            waiterStarted.signal()
+            waiterResult.set(limiter.waitForSlot())
+            waiterFinished.signal()
+        }.start()
+
+        try expectEqual(waiterStarted.wait(timeout: .now() + 1), .success, "stop waiter started")
+        limiter.stop()
+        try expectEqual(
+            waiterFinished.wait(timeout: .now() + 1),
+            .success,
+            "stop should wake the waiting thread"
+        )
+        try expectFalse(waiterResult.get(), "a waiter released by stop must not reserve a slot")
+    }),
+    ("PCMReblocker turns three 480-frame mono inputs into continuous 512-frame outputs", {
+        let reblocker = PCMReblocker()
+        let first = try reblocker.append(
+            PCMInputBlock(
+                sampleRate: 48_000,
+                qpcPosition: 1_000_000,
+                channels: [(0..<480).map(Float.init)]
+            )
+        )
+        let second = try reblocker.append(
+            PCMInputBlock(
+                sampleRate: 48_000,
+                qpcPosition: 1_100_000,
+                channels: [(480..<960).map(Float.init)]
+            )
+        )
+        let third = try reblocker.append(
+            PCMInputBlock(
+                sampleRate: 48_000,
+                qpcPosition: 1_200_000,
+                channels: [(960..<1_440).map(Float.init)]
+            )
+        )
+
+        try expectEqual(first.count, 0, "first 480 frames must remain as carry")
+        try expectEqual(second.count, 1, "960 input frames produce one 512-frame output")
+        try expectEqual(third.count, 1, "the next 480 frames produce another output")
+        try expectEqual(second[0].buffer.frameLength, 512, "first output frame length")
+        try expectEqual(third[0].buffer.frameLength, 512, "second output frame length")
+        try expectEqual(
+            try pcmSamples(second[0].buffer, channel: 0) + pcmSamples(third[0].buffer, channel: 0),
+            (0..<1_024).map(Float.init),
+            "mono samples remain continuous"
+        )
+        try expectEqual(reblocker.carrySampleFrames, 416, "remaining mono carry")
+        try expectEqual(second[0].startQPCPosition, 1_000_000, "first output start QPC")
+        try expectEqual(
+            second[0].sourceSpans,
+            [
+                PCMSourceSpan(qpcPosition: 1_000_000, sourceFrameOffset: 0, sampleFrameCount: 480),
+                PCMSourceSpan(qpcPosition: 1_100_000, sourceFrameOffset: 0, sampleFrameCount: 32)
+            ],
+            "first output source spans"
+        )
+        try expectEqual(
+            third[0].sourceSpans,
+            [
+                PCMSourceSpan(qpcPosition: 1_100_000, sourceFrameOffset: 32, sampleFrameCount: 448),
+                PCMSourceSpan(qpcPosition: 1_200_000, sourceFrameOffset: 0, sampleFrameCount: 64)
+            ],
+            "second output source spans"
+        )
+    }),
+    ("PCMReblocker preserves independent stereo channel order", {
+        let reblocker = PCMReblocker()
+        let left = (0..<960).map(Float.init)
+        let right = (0..<960).map { Float($0) + 10_000 }
+
+        _ = try reblocker.append(
+            PCMInputBlock(
+                sampleRate: 48_000,
+                qpcPosition: 2_000_000,
+                channels: [Array(left[0..<480]), Array(right[0..<480])]
+            )
+        )
+        let outputs = try reblocker.append(
+            PCMInputBlock(
+                sampleRate: 48_000,
+                qpcPosition: 2_100_000,
+                channels: [Array(left[480..<960]), Array(right[480..<960])]
+            )
+        )
+
+        try expectEqual(outputs.count, 1, "stereo output count")
+        try expectEqual(try pcmSamples(outputs[0].buffer, channel: 0), Array(left[0..<512]), "left channel")
+        try expectEqual(try pcmSamples(outputs[0].buffer, channel: 1), Array(right[0..<512]), "right channel")
+    }),
+    ("PCMReblocker conserves sample frames over a long input sequence", {
+        let reblocker = PCMReblocker()
+        var outputSampleFrames = 0
+
+        for inputIndex in 0..<100 {
+            let start = inputIndex * 480
+            let outputs = try reblocker.append(
+                PCMInputBlock(
+                    sampleRate: 48_000,
+                    qpcPosition: UInt64(3_000_000 + inputIndex * 100_000),
+                    channels: [(start..<(start + 480)).map(Float.init)]
+                )
+            )
+            outputSampleFrames += outputs.reduce(0) { $0 + Int($1.buffer.frameLength) }
+        }
+
+        try expectEqual(
+            outputSampleFrames + reblocker.carrySampleFrames,
+            48_000,
+            "output plus carry must equal all input sample frames"
+        )
+    }),
+    ("PCMReblocker stop discards partial carry", {
+        let reblocker = PCMReblocker()
+        _ = try reblocker.append(
+            PCMInputBlock(
+                sampleRate: 48_000,
+                qpcPosition: 4_000_000,
+                channels: [(0..<480).map(Float.init)]
+            )
+        )
+        try expectEqual(reblocker.carrySampleFrames, 480, "carry before stop")
+
+        reblocker.stop()
+
+        try expectEqual(reblocker.carrySampleFrames, 0, "stop clears carry")
+    }),
     ("LatestFrameBuffer keeps only the newest frame", {
         let buffer = LatestFrameBuffer<String>()
 
@@ -201,6 +495,18 @@ let tests: [(String, () throws -> Void)] = [
         try expectEqual(buffer.put("B"), .replaced, "B replaces A")
         try expectEqual(buffer.put("C"), .replaced, "C replaces B")
         try expectEqual(buffer.waitForLatest(), "C", "newest frame")
+    }),
+    ("LatestFrameBuffer reports the exact replaced element", {
+        let buffer = LatestFrameBuffer<String>()
+
+        let first = buffer.putReturningReplaced("A")
+        let second = buffer.putReturningReplaced("B")
+
+        try expectEqual(first.result, .stored, "first insertion result")
+        try expectNil(first.replaced, "first insertion replaced value")
+        try expectEqual(second.result, .replaced, "second insertion result")
+        try expectEqual(second.replaced, "A", "exact replaced value")
+        try expectEqual(buffer.waitForLatest(), "B", "latest value remains capacity one")
     }),
     ("LatestFrameBuffer stop wakes an empty waiter", {
         let buffer = LatestFrameBuffer<String>()
@@ -239,6 +545,136 @@ let tests: [(String, () throws -> Void)] = [
 
         try expectEqual(jump?.actualDelta, 400_000, "actual QPC delta")
         try expectEqual(jump?.expectedDelta, 100_000, "expected QPC delta")
+    }),
+    ("Audio evidence windows align to five-second wall clock boundaries", {
+        let window = AudioEvidenceClock.alignedWindow(
+            containing: Date(timeIntervalSince1970: 12.345),
+            duration: 5
+        )
+
+        try expectEqual(window.start, Date(timeIntervalSince1970: 10), "aligned window start")
+        try expectEqual(window.end, Date(timeIntervalSince1970: 15), "aligned window end")
+    }),
+    ("Audio evidence window reports deltas and frame distribution", {
+        var tracker = AudioEvidenceWindowTracker(
+            windowStart: Date(timeIntervalSince1970: 10)
+        )
+        tracker.recordReceived(
+            frameCount: 480,
+            dropped: false,
+            at: Date(timeIntervalSince1970: 10.1)
+        )
+        tracker.recordReceived(
+            frameCount: 960,
+            dropped: true,
+            at: Date(timeIntervalSince1970: 10.4)
+        )
+        tracker.recordScheduled(qpcJumpActualDelta: nil)
+        tracker.recordScheduled(qpcJumpActualDelta: 400_000)
+        tracker.recordCompleted()
+        tracker.recordCompleted()
+
+        let snapshot = tracker.snapshotAndReset(
+            windowEnd: Date(timeIntervalSince1970: 15)
+        )
+
+        try expectEqual(snapshot.receivedFrames, 2, "received delta")
+        try expectEqual(snapshot.scheduledFrames, 2, "scheduled delta")
+        try expectEqual(snapshot.completedFrames, 2, "completion delta")
+        try expectEqual(snapshot.droppedFrames, 1, "dropped delta")
+        try expectEqual(snapshot.frameCountDistribution, [480: 1, 960: 1], "frame count distribution")
+        try expectEqual(snapshot.qpcJumps, 1, "QPC jump delta")
+        try expectEqual(snapshot.maximumQpcDelta, 400_000, "maximum QPC delta")
+        try expectEqual(snapshot.maximumArrivalGapMilliseconds, 300, "maximum arrival gap")
+
+        tracker.recordReceived(
+            frameCount: 480,
+            dropped: false,
+            at: Date(timeIntervalSince1970: 15.1)
+        )
+        let nextSnapshot = tracker.snapshotAndReset(
+            windowEnd: Date(timeIntervalSince1970: 20)
+        )
+        try expectEqual(nextSnapshot.start, Date(timeIntervalSince1970: 15), "next window start")
+        try expectEqual(nextSnapshot.receivedFrames, 1, "next received delta")
+        try expectEqual(nextSnapshot.frameCountDistribution, [480: 1], "next frame distribution")
+    }),
+    ("Audio pipeline evidence tracks buffers and sample-frame conservation", {
+        var tracker = AudioPipelineEvidenceWindowTracker(
+            windowStart: Date(timeIntervalSince1970: 20)
+        )
+        tracker.recordInput(
+            sampleFrameCount: 480,
+            overwrittenSampleFrameCount: 0,
+            qpcJumpActualDelta: nil,
+            at: Date(timeIntervalSince1970: 20.01)
+        )
+        tracker.recordInput(
+            sampleFrameCount: 480,
+            overwrittenSampleFrameCount: 480,
+            qpcJumpActualDelta: 200_000,
+            at: Date(timeIntervalSince1970: 20.02)
+        )
+        tracker.recordReblocked(
+            outputSampleFrameCount: 512,
+            startQPCPosition: 10_000,
+            endQPCPosition: 116_667,
+            sourceSpanCount: 2
+        )
+        tracker.recordScheduled(outputSampleFrameCount: 512)
+        tracker.recordCompleted(outputSampleFrameCount: 512)
+        tracker.updateCarry(sampleFrameCount: 448)
+
+        let snapshot = tracker.snapshotAndReset(
+            windowEnd: Date(timeIntervalSince1970: 25)
+        )
+
+        try expectEqual(snapshot.receivedInputBuffers, 2, "received input buffers")
+        try expectEqual(snapshot.receivedInputSampleFrames, 960, "received input sample frames")
+        try expectEqual(snapshot.overwrittenInputBuffers, 1, "overwritten input buffers")
+        try expectEqual(snapshot.overwrittenInputSampleFrames, 480, "overwritten input sample frames")
+        try expectEqual(snapshot.reblockedOutputBuffers, 1, "reblocked output buffers")
+        try expectEqual(snapshot.reblockedOutputSampleFrames, 512, "reblocked output sample frames")
+        try expectEqual(snapshot.scheduledOutputBuffers, 1, "scheduled output buffers")
+        try expectEqual(snapshot.scheduledOutputSampleFrames, 512, "scheduled output sample frames")
+        try expectEqual(snapshot.completedOutputBuffers, 1, "completed output buffers")
+        try expectEqual(snapshot.completedOutputSampleFrames, 512, "completed output sample frames")
+        try expectEqual(snapshot.carrySampleFrames, 448, "carry sample frames")
+        try expectEqual(snapshot.qpcJumps, 1, "raw input QPC jumps")
+        try expectEqual(snapshot.maximumQpcDelta, 200_000, "raw input maximum QPC delta")
+        try expectEqual(snapshot.outputSourceSpanCount, 2, "output source span count")
+        try expectEqual(snapshot.firstOutputStartQPCPosition, 10_000, "first output QPC")
+        try expectEqual(snapshot.lastOutputEndQPCPosition, 116_667, "last output QPC")
+    }),
+    ("Audio arrival batch reports exact burst boundaries", {
+        var tracker = AudioArrivalBatchTracker()
+
+        try expectNil(
+            tracker.record(at: Date(timeIntervalSince1970: 0), expectedInterval: 0.01, dropped: false),
+            "initial frame"
+        )
+        try expectNil(
+            tracker.record(at: Date(timeIntervalSince1970: 1), expectedInterval: 0.01, dropped: true),
+            "candidate after receive gap"
+        )
+        try expectNil(
+            tracker.record(at: Date(timeIntervalSince1970: 1.001), expectedInterval: 0.01, dropped: true),
+            "batch begins"
+        )
+        try expectNil(
+            tracker.record(at: Date(timeIntervalSince1970: 1.0015), expectedInterval: 0.01, dropped: false),
+            "batch continues"
+        )
+        let batch = tracker.record(
+            at: Date(timeIntervalSince1970: 1.02),
+            expectedInterval: 0.01,
+            dropped: false
+        )
+
+        try expectEqual(batch?.start, Date(timeIntervalSince1970: 1), "batch start")
+        try expectEqual(batch?.end, Date(timeIntervalSince1970: 1.0015), "batch end")
+        try expectEqual(batch?.receivedFrames, 3, "batch frames")
+        try expectEqual(batch?.droppedFrames, 2, "batch drops")
     }),
     ("ReconnectBackoff grows and caps delay", {
         var backoff = ReconnectBackoff(maximumDelay: 10)

@@ -6,6 +6,11 @@ public enum LatestFramePutResult: Equatable, Sendable {
     case stopped
 }
 
+public struct LatestFramePutOutcome<Element> {
+    public let result: LatestFramePutResult
+    public let replaced: Element?
+}
+
 public final class LatestFrameBuffer<Element>: @unchecked Sendable {
     private let condition = NSCondition()
     private var latest: Element?
@@ -15,17 +20,22 @@ public final class LatestFrameBuffer<Element>: @unchecked Sendable {
 
     @discardableResult
     public func put(_ value: Element) -> LatestFramePutResult {
+        putReturningReplaced(value).result
+    }
+
+    public func putReturningReplaced(_ value: Element) -> LatestFramePutOutcome<Element> {
         condition.lock()
         defer { condition.unlock() }
 
         guard !stopped else {
-            return .stopped
+            return LatestFramePutOutcome(result: .stopped, replaced: nil)
         }
 
-        let result: LatestFramePutResult = latest == nil ? .stored : .replaced
+        let replaced = latest
+        let result: LatestFramePutResult = replaced == nil ? .stored : .replaced
         latest = value
         condition.signal()
-        return result
+        return LatestFramePutOutcome(result: result, replaced: replaced)
     }
 
     public func waitForLatest() -> Element? {

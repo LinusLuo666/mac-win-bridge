@@ -156,6 +156,20 @@ public enum ExactByteReaderError: Error, CustomStringConvertible, Equatable {
     }
 }
 
+public enum ExactByteReaderStreamError: Error, CustomStringConvertible, Equatable {
+    case missingStreamError
+    case unexpectedStatus(Int)
+
+    public var description: String {
+        switch self {
+        case .missingStreamError:
+            return "InputStream reported an error without streamError"
+        case .unexpectedStatus(let status):
+            return "InputStream returned zero bytes with unexpected status \(status)"
+        }
+    }
+}
+
 public enum ExactByteReader {
     public static func read(
         byteCount: Int,
@@ -174,6 +188,63 @@ public enum ExactByteReader {
             precondition(count > 0 && count <= byteCount - offset, "reader returned an invalid byte count")
             offset += count
         }
+        return Data(buffer)
+    }
+
+    public static func read(
+        byteCount: Int,
+        from inputStream: InputStream,
+        retryDelay: TimeInterval = 0.005,
+        onZeroRead: ((Stream.Status, Error?, Int) -> Void)? = nil
+    ) throws -> Data? {
+        var buffer = [UInt8](repeating: 0, count: byteCount)
+        var offset = 0
+
+        while offset < byteCount {
+            let count = buffer.withUnsafeMutableBufferPointer { pointer in
+                inputStream.read(
+                    pointer.baseAddress! + offset,
+                    maxLength: byteCount - offset
+                )
+            }
+
+            if count > 0 {
+                precondition(count <= byteCount - offset, "InputStream returned an invalid byte count")
+                offset += count
+                continue
+            }
+
+            if count < 0 {
+                throw inputStream.streamError ?? ExactByteReaderStreamError.missingStreamError
+            }
+
+            let status = inputStream.streamStatus
+            let streamError = inputStream.streamError
+            onZeroRead?(status, streamError, offset)
+
+            switch status {
+            case .atEnd:
+                if offset == 0 {
+                    return nil
+                }
+                throw ExactByteReaderError.truncated(expected: byteCount, actual: offset)
+            case .error:
+                throw streamError ?? ExactByteReaderStreamError.missingStreamError
+            case .open, .opening, .reading:
+                if retryDelay > 0 {
+                    Thread.sleep(forTimeInterval: retryDelay)
+                }
+            case .notOpen, .writing, .closed:
+                throw ExactByteReaderStreamError.unexpectedStatus(
+                    Int(status.rawValue)
+                )
+            @unknown default:
+                throw ExactByteReaderStreamError.unexpectedStatus(
+                    Int(status.rawValue)
+                )
+            }
+        }
+
         return Data(buffer)
     }
 }
