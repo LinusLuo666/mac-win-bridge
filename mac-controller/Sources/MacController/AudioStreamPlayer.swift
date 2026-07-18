@@ -9,14 +9,22 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private let onTermination: @Sendable (Error?) -> Void
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
+    private let latestFrameBuffer = LatestFrameBuffer<WindowsAudioFrame>()
     private let bufferQueueLimiter = AudioBufferQueueLimiter(maximumPendingBuffers: 1)
     private let stateLock = NSLock()
-    private var worker: Thread?
+    private let statisticsLock = NSLock()
+    private var receiverWorker: Thread?
+    private var playbackWorker: Thread?
     private var running = true
+    private var terminationReported = false
     private var playbackFormat: AVAudioFormat?
     private var sourceMetadata: WindowsAudioMetadata?
-    private var receivedFrameCount = 0
+    private var receivedFrames = 0
+    private var droppedFrames = 0
+    private var scheduledFrames = 0
+    private var qpcJumps = 0
     private var receivedPcmBytes = 0
+    private var qpcJumpTracker = AudioQPCJumpTracker()
     private var statisticsStartedAt: Date?
     private var nextStatisticsLogAt = 5.0
 
@@ -33,27 +41,34 @@ final class AudioStreamPlayer: @unchecked Sendable {
     }
 
     func start() {
-        worker = Thread { [weak self] in
-            self?.run()
+        playbackWorker = Thread { [weak self] in
+            self?.playbackLoop()
         }
-        worker?.name = "AudioStreamPlayer"
-        worker?.start()
+        playbackWorker?.name = "AudioStreamPlayback"
+        playbackWorker?.start()
+
+        receiverWorker = Thread { [weak self] in
+            self?.receiveLoop()
+        }
+        receiverWorker?.name = "AudioStreamReceiver"
+        receiverWorker?.start()
     }
 
     func stop() {
         stateLock.lock()
         running = false
+        terminationReported = true
         stateLock.unlock()
+        latestFrameBuffer.stop()
         bufferQueueLimiter.stop()
         playerNode.stop()
         engine.stop()
     }
 
-    private func run() {
+    private func receiveLoop() {
         var terminationError: Error?
-        defer { onTermination(terminationError) }
         do {
-            while shouldRun {
+            receiveFrames: while shouldRun {
                 guard let header = try readExactly(byteCount: WindowsAudioFrameProtocol.headerLength) else {
                     break
                 }
@@ -63,25 +78,64 @@ final class AudioStreamPlayer: @unchecked Sendable {
                 }
 
                 let frame = try WindowsAudioFrameProtocol.parse(payload: payload)
-                try configurePlaybackIfNeeded(for: frame.metadata)
-                guard let playbackFormat,
-                      let buffer = makeBuffer(frame: frame, playbackFormat: playbackFormat) else {
-                    throw RuntimeError("failed to create PCM playback buffer")
+                let putResult = latestFrameBuffer.put(frame)
+                recordReceived(frame: frame, putResult: putResult)
+                if putResult == .stopped {
+                    break receiveFrames
                 }
-
-                guard bufferQueueLimiter.waitForSlot() else {
-                    break
-                }
-                playerNode.scheduleBuffer(buffer) { [weak self] in
-                    self?.bufferQueueLimiter.release()
-                }
-                record(frame: frame)
             }
         } catch {
             terminationError = error
             if shouldRun {
+                print("audio receive failed: \(error)")
+            }
+        }
+        finish(error: terminationError)
+    }
+
+    private func playbackLoop() {
+        do {
+            while shouldRun && bufferQueueLimiter.waitForSlot() {
+                guard let frame = latestFrameBuffer.waitForLatest() else {
+                    bufferQueueLimiter.release()
+                    break
+                }
+
+                do {
+                    try configurePlaybackIfNeeded(for: frame.metadata)
+                    guard let playbackFormat,
+                          let buffer = makeBuffer(frame: frame, playbackFormat: playbackFormat) else {
+                        throw RuntimeError("failed to create PCM playback buffer")
+                    }
+
+                    playerNode.scheduleBuffer(buffer) { [weak self] in
+                        self?.bufferQueueLimiter.release()
+                    }
+                    recordScheduled(frame: frame)
+                } catch {
+                    bufferQueueLimiter.release()
+                    throw error
+                }
+            }
+        } catch {
+            if shouldRun {
                 print("audio playback failed: \(error)")
             }
+            finish(error: error)
+        }
+    }
+
+    private func finish(error: Error?) {
+        stateLock.lock()
+        let shouldNotify = !terminationReported
+        running = false
+        terminationReported = true
+        stateLock.unlock()
+
+        latestFrameBuffer.stop()
+        bufferQueueLimiter.stop()
+        if shouldNotify {
+            onTermination(error)
         }
     }
 
@@ -196,27 +250,66 @@ final class AudioStreamPlayer: @unchecked Sendable {
             | (UInt32(data[offset + 3]) << 24)
     }
 
-    private func record(frame: WindowsAudioFrame) {
-        receivedFrameCount += 1
+    private func recordReceived(frame: WindowsAudioFrame, putResult: LatestFramePutResult) {
+        statisticsLock.lock()
+        receivedFrames += 1
         receivedPcmBytes += frame.pcm.count
+        if putResult == .replaced {
+            droppedFrames += 1
+        }
         if statisticsStartedAt == nil {
             statisticsStartedAt = Date()
         }
-        guard let statisticsStartedAt else { return }
+        let elapsed = Date().timeIntervalSince(statisticsStartedAt ?? Date())
+        let shouldLog = elapsed >= nextStatisticsLogAt
+        if shouldLog {
+            nextStatisticsLogAt += 5
+        }
+        let snapshot = (
+            receivedFrames,
+            droppedFrames,
+            scheduledFrames,
+            qpcJumps,
+            receivedPcmBytes
+        )
+        statisticsLock.unlock()
 
-        let elapsed = Date().timeIntervalSince(statisticsStartedAt)
-        if elapsed >= nextStatisticsLogAt {
+        if shouldLog {
             print(
                 String(
-                    format: "audio receive stats elapsed=%.1fs frames=%d pcmBytes=%d engineRunning=%@ playerPlaying=%@",
+                    format: "audio stats elapsed=%.1fs receivedFrames=%d droppedFrames=%d scheduledFrames=%d qpcJumps=%d pcmBytes=%d engineRunning=%@ playerPlaying=%@",
                     elapsed,
-                    receivedFrameCount,
-                    receivedPcmBytes,
+                    snapshot.0,
+                    snapshot.1,
+                    snapshot.2,
+                    snapshot.3,
+                    snapshot.4,
                     engine.isRunning.description,
                     playerNode.isPlaying.description
                 )
             )
-            nextStatisticsLogAt += 5
+        }
+    }
+
+    private func recordScheduled(frame: WindowsAudioFrame) {
+        statisticsLock.lock()
+        scheduledFrames += 1
+        let jump = qpcJumpTracker.record(
+            position: frame.metadata.qpcPosition,
+            frameCount: frame.metadata.frameCount,
+            sampleRate: frame.metadata.sampleRate
+        )
+        if jump != nil {
+            qpcJumps += 1
+        }
+        let droppedSnapshot = droppedFrames
+        statisticsLock.unlock()
+
+        if let jump {
+            let actualDelta = jump.actualDelta.map { String($0) } ?? "n/a"
+            print(
+                "audio qpc jump direction=\(jump.direction.rawValue) previous=\(jump.previousPosition) current=\(jump.currentPosition) actualDelta=\(actualDelta) expectedDelta=\(jump.expectedDelta) droppedFrames=\(droppedSnapshot)"
+            )
         }
     }
 
