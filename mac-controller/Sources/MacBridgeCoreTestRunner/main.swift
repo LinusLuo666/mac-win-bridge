@@ -219,6 +219,27 @@ let tests: [(String, () throws -> Void)] = [
         try expectEqual(finished.wait(timeout: .now() + 1), .success, "waiter finished")
         try expectNil(result.get(), "stopped wait result")
     }),
+    ("AudioQPCJumpTracker accepts contiguous packets", {
+        var tracker = AudioQPCJumpTracker()
+
+        try expectNil(
+            tracker.record(position: 1_000_000, frameCount: 480, sampleRate: 48_000),
+            "first frame"
+        )
+        try expectNil(
+            tracker.record(position: 1_100_000, frameCount: 480, sampleRate: 48_000),
+            "contiguous frame"
+        )
+    }),
+    ("AudioQPCJumpTracker reports skipped playback time", {
+        var tracker = AudioQPCJumpTracker()
+
+        _ = tracker.record(position: 1_000_000, frameCount: 480, sampleRate: 48_000)
+        let jump = tracker.record(position: 1_400_000, frameCount: 480, sampleRate: 48_000)
+
+        try expectEqual(jump?.actualDelta, 400_000, "actual QPC delta")
+        try expectEqual(jump?.expectedDelta, 100_000, "expected QPC delta")
+    }),
     ("ReconnectBackoff grows and caps delay", {
         var backoff = ReconnectBackoff(maximumDelay: 10)
         try expectEqual(backoff.nextDelay(), 1, "first delay")
