@@ -785,6 +785,19 @@ let tests: [(String, () throws -> Void)] = [
         tracker.recordScheduled(outputSampleFrameCount: 512)
         tracker.recordCompleted(outputSampleFrameCount: 512)
         tracker.updateCarry(sampleFrameCount: 448)
+        tracker.recordJitterBuffer(
+            configuredLatencyMilliseconds: 50,
+            effectiveTargetSampleFrames: 2_560,
+            queuedOutputBuffers: 5,
+            queuedOutputSampleFrames: 2_560,
+            scheduledPendingSampleFrames: 1_024,
+            trimmedOutputBuffersDelta: 2,
+            trimmedOutputSampleFramesDelta: 1_024,
+            underrunCountDelta: 1,
+            rebufferCountDelta: 1,
+            rebufferDurationMillisecondsDelta: 53,
+            maximumQueuedSampleFrames: 3_584
+        )
 
         let snapshot = tracker.snapshotAndReset(
             windowEnd: Date(timeIntervalSince1970: 25)
@@ -806,6 +819,30 @@ let tests: [(String, () throws -> Void)] = [
         try expectEqual(snapshot.outputSourceSpanCount, 2, "output source span count")
         try expectEqual(snapshot.firstOutputStartQPCPosition, 10_000, "first output QPC")
         try expectEqual(snapshot.lastOutputEndQPCPosition, 116_667, "last output QPC")
+        try expectEqual(snapshot.configuredLatencyMilliseconds, 50, "configured latency")
+        try expectEqual(snapshot.effectiveTargetSampleFrames, 2_560, "effective target")
+        try expectEqual(snapshot.queuedOutputBuffers, 5, "queued output buffers")
+        try expectEqual(snapshot.queuedOutputSampleFrames, 2_560, "queued output frames")
+        try expectEqual(snapshot.scheduledPendingSampleFrames, 1_024, "pending scheduled frames")
+        try expectEqual(snapshot.trimmedOutputBuffers, 2, "trimmed output buffers")
+        try expectEqual(snapshot.trimmedOutputSampleFrames, 1_024, "trimmed output frames")
+        try expectEqual(snapshot.underrunCount, 1, "underrun count")
+        try expectEqual(snapshot.rebufferCount, 1, "rebuffer count")
+        try expectEqual(snapshot.rebufferDurationMilliseconds, 53, "rebuffer duration")
+        try expectEqual(snapshot.maximumQueuedSampleFrames, 3_584, "maximum queue depth")
+
+        let nextSnapshot = tracker.snapshotAndReset(
+            windowEnd: Date(timeIntervalSince1970: 30)
+        )
+        try expectEqual(nextSnapshot.configuredLatencyMilliseconds, 50, "next configured latency")
+        try expectEqual(nextSnapshot.effectiveTargetSampleFrames, 2_560, "next effective target")
+        try expectEqual(nextSnapshot.queuedOutputSampleFrames, 2_560, "next queued gauge")
+        try expectEqual(nextSnapshot.scheduledPendingSampleFrames, 1_024, "next pending gauge")
+        try expectEqual(nextSnapshot.trimmedOutputBuffers, 0, "next trimmed delta")
+        try expectEqual(nextSnapshot.underrunCount, 0, "next underrun delta")
+        try expectEqual(nextSnapshot.rebufferCount, 0, "next rebuffer delta")
+        try expectEqual(nextSnapshot.rebufferDurationMilliseconds, 0, "next rebuffer duration")
+        try expectEqual(nextSnapshot.maximumQueuedSampleFrames, 0, "next maximum queue depth")
     }),
     ("Audio arrival batch reports exact burst boundaries", {
         var tracker = AudioArrivalBatchTracker()

@@ -5,8 +5,6 @@ import MacBridgeCore
 private struct AudioPipelineTotals {
     let receivedInputBuffers: Int
     let receivedInputSampleFrames: Int
-    let overwrittenInputBuffers: Int
-    let overwrittenInputSampleFrames: Int
     let reblockedOutputBuffers: Int
     let reblockedOutputSampleFrames: Int
     let scheduledOutputBuffers: Int
@@ -15,6 +13,7 @@ private struct AudioPipelineTotals {
     let completedOutputSampleFrames: Int
     let carrySampleFrames: Int
     let qpcJumps: Int
+    let jitterBuffer: PCMOutputJitterBufferSnapshot
 }
 
 final class AudioStreamPlayer: @unchecked Sendable {
@@ -24,9 +23,9 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private let onTermination: @Sendable (Error?) -> Void
     private let engine = AVAudioEngine()
     private let playerNode = AVAudioPlayerNode()
-    private let latestFrameBuffer = LatestFrameBuffer<WindowsAudioFrame>()
     private let bufferQueueLimiter = AudioBufferQueueLimiter(maximumPendingBuffers: 2)
     private let reblocker = PCMReblocker()
+    private let jitterBuffer: PCMOutputJitterBuffer
     private let stateLock = NSLock()
     private let statisticsLock = NSLock()
     private let evidenceQueue = DispatchQueue(
@@ -42,8 +41,6 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private var sourceMetadata: WindowsAudioMetadata?
     private var receivedInputBuffers = 0
     private var receivedInputSampleFrames = 0
-    private var overwrittenInputBuffers = 0
-    private var overwrittenInputSampleFrames = 0
     private var reblockedOutputBuffers = 0
     private var reblockedOutputSampleFrames = 0
     private var scheduledOutputBuffers = 0
@@ -59,16 +56,25 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private var nextEvidenceWindowEnd: Date
     private var arrivalBatchTracker = AudioArrivalBatchTracker()
     private var loggedTemporaryZeroRead = false
+    private var recordedTrimmedOutputBuffers = 0
+    private var recordedTrimmedOutputSampleFrames = 0
+    private var recordedUnderrunCount = 0
+    private var recordedRebufferCount = 0
+    private var recordedRebufferDurationMilliseconds = 0
 
     init(
         inputStream: InputStream,
         volume: Double,
         muted: Bool,
+        latencyMilliseconds: Int = AudioLatencySetting.defaultMilliseconds,
         onTermination: @escaping @Sendable (Error?) -> Void
     ) {
         self.inputStream = inputStream
         self.volume = Float(min(max(volume, 0), 1))
         self.muted = muted
+        jitterBuffer = PCMOutputJitterBuffer(
+            requestedLatencyMilliseconds: latencyMilliseconds
+        )
         self.onTermination = onTermination
         let evidenceWindow = AudioEvidenceClock.alignedWindow(
             containing: Date(),
@@ -105,7 +111,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
         stateLock.unlock()
         stopEvidenceLogging()
         flushArrivalBatch()
-        latestFrameBuffer.stop()
+        jitterBuffer.stop()
         bufferQueueLimiter.stop()
         reblocker.stop()
         playerNode.stop()
@@ -115,7 +121,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
     private func receiveLoop() {
         var terminationError: Error?
         do {
-            receiveFrames: while shouldRun {
+            while shouldRun {
                 guard let header = try readExactly(byteCount: WindowsAudioFrameProtocol.headerLength) else {
                     break
                 }
@@ -125,11 +131,12 @@ final class AudioStreamPlayer: @unchecked Sendable {
                 }
 
                 let frame = try WindowsAudioFrameProtocol.parse(payload: payload)
-                let putOutcome = latestFrameBuffer.putReturningReplaced(frame)
-                recordReceived(frame: frame, putOutcome: putOutcome)
-                if putOutcome.result == .stopped {
-                    break receiveFrames
-                }
+                recordReceived(frame: frame)
+                try configurePlaybackIfNeeded(for: frame.metadata)
+                let outputs = try reblocker.append(decodeInputBlock(frame: frame))
+                recordReblocked(outputs: outputs, carrySampleFrames: reblocker.carrySampleFrames)
+                let enqueueResult = jitterBuffer.enqueue(outputs)
+                recordJitterBuffer(enqueueResult: enqueueResult)
             }
         } catch {
             terminationError = error
@@ -141,37 +148,26 @@ final class AudioStreamPlayer: @unchecked Sendable {
     }
 
     private func playbackLoop() {
-        do {
-            while shouldRun {
-                guard let frame = latestFrameBuffer.waitForLatest() else {
-                    break
-                }
-
-                try configurePlaybackIfNeeded(for: frame.metadata)
-                let outputs = try reblocker.append(decodeInputBlock(frame: frame))
-                recordReblocked(outputs: outputs, carrySampleFrames: reblocker.carrySampleFrames)
-
-                for output in outputs {
-                    guard bufferQueueLimiter.waitForSlot() else {
-                        return
-                    }
-
-                    let outputSampleFrames = Int(output.buffer.frameLength)
-                    playerNode.scheduleBuffer(output.buffer) { [weak self] in
-                        guard let self else {
-                            return
-                        }
-                        bufferQueueLimiter.release()
-                        recordCompleted(outputSampleFrames: outputSampleFrames)
-                    }
-                    recordScheduled(output: output)
-                }
+        while shouldRun {
+            guard bufferQueueLimiter.waitForSlot() else {
+                return
             }
-        } catch {
-            if shouldRun {
-                AudioRuntimeLog.write("audio playback failed: \(error)")
+            guard let output = jitterBuffer.waitForNextToSchedule() else {
+                return
             }
-            finish(error: error)
+
+            let outputSampleFrames = Int(output.buffer.frameLength)
+            playerNode.scheduleBuffer(output.buffer) { [weak self] in
+                guard let self else {
+                    return
+                }
+                jitterBuffer.completeScheduled(sampleFrames: outputSampleFrames)
+                bufferQueueLimiter.release()
+                recordCompleted(outputSampleFrames: outputSampleFrames)
+                recordJitterBuffer(enqueueResult: nil)
+            }
+            recordScheduled(output: output)
+            recordJitterBuffer(enqueueResult: nil)
         }
     }
 
@@ -184,7 +180,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
 
         stopEvidenceLogging()
         flushArrivalBatch()
-        latestFrameBuffer.stop()
+        jitterBuffer.stop()
         bufferQueueLimiter.stop()
         reblocker.stop()
         if shouldNotify {
@@ -304,19 +300,11 @@ final class AudioStreamPlayer: @unchecked Sendable {
             | (UInt32(data[offset + 3]) << 24)
     }
 
-    private func recordReceived(
-        frame: WindowsAudioFrame,
-        putOutcome: LatestFramePutOutcome<WindowsAudioFrame>
-    ) {
+    private func recordReceived(frame: WindowsAudioFrame) {
         let receivedAt = Date()
-        let overwrittenSampleFrames = putOutcome.replaced?.metadata.frameCount ?? 0
         statisticsLock.lock()
         receivedInputBuffers += 1
         receivedInputSampleFrames += frame.metadata.frameCount
-        if overwrittenSampleFrames > 0 {
-            overwrittenInputBuffers += 1
-            overwrittenInputSampleFrames += overwrittenSampleFrames
-        }
         let jump = qpcJumpTracker.record(
             position: frame.metadata.qpcPosition,
             frameCount: frame.metadata.frameCount,
@@ -327,14 +315,14 @@ final class AudioStreamPlayer: @unchecked Sendable {
         }
         evidenceWindowTracker.recordInput(
             sampleFrameCount: frame.metadata.frameCount,
-            overwrittenSampleFrameCount: overwrittenSampleFrames,
+            overwrittenSampleFrameCount: 0,
             qpcJumpActualDelta: jump?.actualDelta,
             at: receivedAt
         )
         let batch = arrivalBatchTracker.record(
             at: receivedAt,
             expectedInterval: Double(frame.metadata.frameCount) / Double(frame.metadata.sampleRate),
-            dropped: overwrittenSampleFrames > 0
+            dropped: false
         )
         if statisticsStartedAt == nil {
             statisticsStartedAt = Date()
@@ -360,12 +348,10 @@ final class AudioStreamPlayer: @unchecked Sendable {
         if shouldLog {
             AudioRuntimeLog.write(
                 String(
-                    format: "audio stats elapsed=%.1fs receivedInputBuffers=%d receivedInputSampleFrames=%d overwrittenInputBuffers=%d overwrittenInputSampleFrames=%d reblockedOutputBuffers=%d reblockedOutputSampleFrames=%d scheduledOutputBuffers=%d scheduledOutputSampleFrames=%d completedOutputBuffers=%d completedOutputSampleFrames=%d carrySampleFrames=%d qpcJumps=%d engineRunning=%@ playerPlaying=%@",
+                    format: "audio stats elapsed=%.1fs receivedInputBuffers=%d receivedInputSampleFrames=%d reblockedOutputBuffers=%d reblockedOutputSampleFrames=%d scheduledOutputBuffers=%d scheduledOutputSampleFrames=%d completedOutputBuffers=%d completedOutputSampleFrames=%d carrySampleFrames=%d configuredLatencyMs=%d effectiveTargetSampleFrames=%d queuedOutputBuffers=%d queuedOutputSampleFrames=%d scheduledPendingSampleFrames=%d trimmedOutputBuffers=%d trimmedOutputSampleFrames=%d underrunCount=%d rebufferCount=%d rebufferDurationMs=%d maximumQueuedSampleFrames=%d qpcJumps=%d engineRunning=%@ playerPlaying=%@",
                     elapsed,
                     snapshot.receivedInputBuffers,
                     snapshot.receivedInputSampleFrames,
-                    snapshot.overwrittenInputBuffers,
-                    snapshot.overwrittenInputSampleFrames,
                     snapshot.reblockedOutputBuffers,
                     snapshot.reblockedOutputSampleFrames,
                     snapshot.scheduledOutputBuffers,
@@ -373,6 +359,17 @@ final class AudioStreamPlayer: @unchecked Sendable {
                     snapshot.completedOutputBuffers,
                     snapshot.completedOutputSampleFrames,
                     snapshot.carrySampleFrames,
+                    snapshot.jitterBuffer.requestedLatencyMilliseconds,
+                    snapshot.jitterBuffer.effectiveTargetSampleFrames ?? 0,
+                    snapshot.jitterBuffer.queuedOutputBuffers,
+                    snapshot.jitterBuffer.queuedOutputSampleFrames,
+                    snapshot.jitterBuffer.scheduledPendingSampleFrames,
+                    snapshot.jitterBuffer.trimmedOutputBuffers,
+                    snapshot.jitterBuffer.trimmedOutputSampleFrames,
+                    snapshot.jitterBuffer.underrunCount,
+                    snapshot.jitterBuffer.rebufferCount,
+                    snapshot.jitterBuffer.totalRebufferDurationMilliseconds,
+                    snapshot.jitterBuffer.maximumQueuedSampleFrames,
                     snapshot.qpcJumps,
                     engine.isRunning.description,
                     playerNode.isPlaying.description
@@ -416,6 +413,47 @@ final class AudioStreamPlayer: @unchecked Sendable {
         statisticsLock.unlock()
     }
 
+    private func recordJitterBuffer(
+        enqueueResult _: PCMOutputJitterBufferEnqueueResult?
+    ) {
+        statisticsLock.lock()
+        let snapshot = jitterBuffer.snapshot()
+        let trimmedBuffersDelta = max(
+            0,
+            snapshot.trimmedOutputBuffers - recordedTrimmedOutputBuffers
+        )
+        let trimmedSampleFramesDelta = max(
+            0,
+            snapshot.trimmedOutputSampleFrames - recordedTrimmedOutputSampleFrames
+        )
+        let underrunDelta = max(0, snapshot.underrunCount - recordedUnderrunCount)
+        let rebufferDelta = max(0, snapshot.rebufferCount - recordedRebufferCount)
+        let rebufferDurationDelta = max(
+            0,
+            snapshot.totalRebufferDurationMilliseconds
+                - recordedRebufferDurationMilliseconds
+        )
+        evidenceWindowTracker.recordJitterBuffer(
+            configuredLatencyMilliseconds: snapshot.requestedLatencyMilliseconds,
+            effectiveTargetSampleFrames: snapshot.effectiveTargetSampleFrames,
+            queuedOutputBuffers: snapshot.queuedOutputBuffers,
+            queuedOutputSampleFrames: snapshot.queuedOutputSampleFrames,
+            scheduledPendingSampleFrames: snapshot.scheduledPendingSampleFrames,
+            trimmedOutputBuffersDelta: trimmedBuffersDelta,
+            trimmedOutputSampleFramesDelta: trimmedSampleFramesDelta,
+            underrunCountDelta: underrunDelta,
+            rebufferCountDelta: rebufferDelta,
+            rebufferDurationMillisecondsDelta: rebufferDurationDelta,
+            maximumQueuedSampleFrames: snapshot.maximumQueuedSampleFrames
+        )
+        recordedTrimmedOutputBuffers = snapshot.trimmedOutputBuffers
+        recordedTrimmedOutputSampleFrames = snapshot.trimmedOutputSampleFrames
+        recordedUnderrunCount = snapshot.underrunCount
+        recordedRebufferCount = snapshot.rebufferCount
+        recordedRebufferDurationMilliseconds = snapshot.totalRebufferDurationMilliseconds
+        statisticsLock.unlock()
+    }
+
     private func outputEndQPCPosition(_ output: ReblockedPCMOutput) -> UInt64 {
         guard let metadata = sourceMetadata, let lastSpan = output.sourceSpans.last else {
             return output.startQPCPosition
@@ -429,8 +467,6 @@ final class AudioStreamPlayer: @unchecked Sendable {
         AudioPipelineTotals(
             receivedInputBuffers: receivedInputBuffers,
             receivedInputSampleFrames: receivedInputSampleFrames,
-            overwrittenInputBuffers: overwrittenInputBuffers,
-            overwrittenInputSampleFrames: overwrittenInputSampleFrames,
             reblockedOutputBuffers: reblockedOutputBuffers,
             reblockedOutputSampleFrames: reblockedOutputSampleFrames,
             scheduledOutputBuffers: scheduledOutputBuffers,
@@ -438,7 +474,8 @@ final class AudioStreamPlayer: @unchecked Sendable {
             completedOutputBuffers: completedOutputBuffers,
             completedOutputSampleFrames: completedOutputSampleFrames,
             carrySampleFrames: carrySampleFrames,
-            qpcJumps: qpcJumps
+            qpcJumps: qpcJumps,
+            jitterBuffer: jitterBuffer.snapshot()
         )
     }
 
@@ -492,7 +529,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
             let firstOutputQPC = snapshot.firstOutputStartQPCPosition.map(String.init) ?? "none"
             let lastOutputQPC = snapshot.lastOutputEndQPCPosition.map(String.init) ?? "none"
             AudioRuntimeLog.write(
-                "audio evidence window start=\(AudioEvidenceClock.timestamp(snapshot.start)) end=\(AudioEvidenceClock.timestamp(snapshot.end)) receivedInputBuffers=\(snapshot.receivedInputBuffers) receivedInputSampleFrames=\(snapshot.receivedInputSampleFrames) overwrittenInputBuffers=\(snapshot.overwrittenInputBuffers) overwrittenInputSampleFrames=\(snapshot.overwrittenInputSampleFrames) reblockedOutputBuffers=\(snapshot.reblockedOutputBuffers) reblockedOutputSampleFrames=\(snapshot.reblockedOutputSampleFrames) scheduledOutputBuffers=\(snapshot.scheduledOutputBuffers) scheduledOutputSampleFrames=\(snapshot.scheduledOutputSampleFrames) completedOutputBuffers=\(snapshot.completedOutputBuffers) completedOutputSampleFrames=\(snapshot.completedOutputSampleFrames) carrySampleFrames=\(snapshot.carrySampleFrames) inputFrameCounts=\(frameCounts.isEmpty ? "none" : frameCounts) qpcJumps=\(snapshot.qpcJumps) maxQpcDelta=\(maximumQpcDelta) maxArrivalGapMs=\(snapshot.maximumArrivalGapMilliseconds) outputSourceSpanCount=\(snapshot.outputSourceSpanCount) firstOutputStartQPC=\(firstOutputQPC) lastOutputEndQPC=\(lastOutputQPC) totalReceivedInputBuffers=\(totals.receivedInputBuffers) totalReceivedInputSampleFrames=\(totals.receivedInputSampleFrames) totalOverwrittenInputBuffers=\(totals.overwrittenInputBuffers) totalOverwrittenInputSampleFrames=\(totals.overwrittenInputSampleFrames) totalReblockedOutputBuffers=\(totals.reblockedOutputBuffers) totalReblockedOutputSampleFrames=\(totals.reblockedOutputSampleFrames) totalScheduledOutputBuffers=\(totals.scheduledOutputBuffers) totalScheduledOutputSampleFrames=\(totals.scheduledOutputSampleFrames) totalCompletedOutputBuffers=\(totals.completedOutputBuffers) totalCompletedOutputSampleFrames=\(totals.completedOutputSampleFrames) totalCarrySampleFrames=\(totals.carrySampleFrames) totalQpcJumps=\(totals.qpcJumps) engineRunning=\(engine.isRunning) playerPlaying=\(playerNode.isPlaying)",
+                "audio evidence window start=\(AudioEvidenceClock.timestamp(snapshot.start)) end=\(AudioEvidenceClock.timestamp(snapshot.end)) receivedInputBuffers=\(snapshot.receivedInputBuffers) receivedInputSampleFrames=\(snapshot.receivedInputSampleFrames) reblockedOutputBuffers=\(snapshot.reblockedOutputBuffers) reblockedOutputSampleFrames=\(snapshot.reblockedOutputSampleFrames) scheduledOutputBuffers=\(snapshot.scheduledOutputBuffers) scheduledOutputSampleFrames=\(snapshot.scheduledOutputSampleFrames) completedOutputBuffers=\(snapshot.completedOutputBuffers) completedOutputSampleFrames=\(snapshot.completedOutputSampleFrames) carrySampleFrames=\(snapshot.carrySampleFrames) configuredLatencyMs=\(snapshot.configuredLatencyMilliseconds ?? 0) effectiveTargetSampleFrames=\(snapshot.effectiveTargetSampleFrames ?? 0) queuedOutputBuffers=\(snapshot.queuedOutputBuffers) queuedOutputSampleFrames=\(snapshot.queuedOutputSampleFrames) scheduledPendingSampleFrames=\(snapshot.scheduledPendingSampleFrames) trimmedOutputBuffers=\(snapshot.trimmedOutputBuffers) trimmedOutputSampleFrames=\(snapshot.trimmedOutputSampleFrames) underrunCount=\(snapshot.underrunCount) rebufferCount=\(snapshot.rebufferCount) rebufferDurationMs=\(snapshot.rebufferDurationMilliseconds) maximumQueuedSampleFrames=\(snapshot.maximumQueuedSampleFrames) inputFrameCounts=\(frameCounts.isEmpty ? "none" : frameCounts) qpcJumps=\(snapshot.qpcJumps) maxQpcDelta=\(maximumQpcDelta) maxArrivalGapMs=\(snapshot.maximumArrivalGapMilliseconds) outputSourceSpanCount=\(snapshot.outputSourceSpanCount) firstOutputStartQPC=\(firstOutputQPC) lastOutputEndQPC=\(lastOutputQPC) totalReceivedInputBuffers=\(totals.receivedInputBuffers) totalReceivedInputSampleFrames=\(totals.receivedInputSampleFrames) totalReblockedOutputBuffers=\(totals.reblockedOutputBuffers) totalReblockedOutputSampleFrames=\(totals.reblockedOutputSampleFrames) totalScheduledOutputBuffers=\(totals.scheduledOutputBuffers) totalScheduledOutputSampleFrames=\(totals.scheduledOutputSampleFrames) totalCompletedOutputBuffers=\(totals.completedOutputBuffers) totalCompletedOutputSampleFrames=\(totals.completedOutputSampleFrames) totalCarrySampleFrames=\(totals.carrySampleFrames) totalConfiguredLatencyMs=\(totals.jitterBuffer.requestedLatencyMilliseconds) totalEffectiveTargetSampleFrames=\(totals.jitterBuffer.effectiveTargetSampleFrames ?? 0) totalQueuedOutputBuffers=\(totals.jitterBuffer.queuedOutputBuffers) totalQueuedOutputSampleFrames=\(totals.jitterBuffer.queuedOutputSampleFrames) totalScheduledPendingSampleFrames=\(totals.jitterBuffer.scheduledPendingSampleFrames) totalTrimmedOutputBuffers=\(totals.jitterBuffer.trimmedOutputBuffers) totalTrimmedOutputSampleFrames=\(totals.jitterBuffer.trimmedOutputSampleFrames) totalUnderrunCount=\(totals.jitterBuffer.underrunCount) totalRebufferCount=\(totals.jitterBuffer.rebufferCount) totalRebufferDurationMs=\(totals.jitterBuffer.totalRebufferDurationMilliseconds) totalMaximumQueuedSampleFrames=\(totals.jitterBuffer.maximumQueuedSampleFrames) totalQpcJumps=\(totals.qpcJumps) engineRunning=\(engine.isRunning) playerPlaying=\(playerNode.isPlaying)",
                 at: snapshot.end
             )
         }
@@ -509,7 +546,7 @@ final class AudioStreamPlayer: @unchecked Sendable {
 
     private func logArrivalBatch(_ batch: AudioArrivalBatch) {
         AudioRuntimeLog.write(
-            "audio arrival batch start=\(AudioEvidenceClock.timestamp(batch.start)) end=\(AudioEvidenceClock.timestamp(batch.end)) receivedInputBuffers=\(batch.receivedFrames) overwrittenInputBuffers=\(batch.droppedFrames) engineRunning=\(engine.isRunning) playerPlaying=\(playerNode.isPlaying)",
+            "audio arrival batch start=\(AudioEvidenceClock.timestamp(batch.start)) end=\(AudioEvidenceClock.timestamp(batch.end)) receivedInputBuffers=\(batch.receivedFrames) engineRunning=\(engine.isRunning) playerPlaying=\(playerNode.isPlaying)",
             at: batch.end
         )
     }

@@ -137,6 +137,17 @@ public struct AudioPipelineEvidenceWindowSnapshot: Equatable, Sendable {
     public let outputSourceSpanCount: Int
     public let firstOutputStartQPCPosition: UInt64?
     public let lastOutputEndQPCPosition: UInt64?
+    public let configuredLatencyMilliseconds: Int?
+    public let effectiveTargetSampleFrames: Int?
+    public let queuedOutputBuffers: Int
+    public let queuedOutputSampleFrames: Int
+    public let scheduledPendingSampleFrames: Int
+    public let trimmedOutputBuffers: Int
+    public let trimmedOutputSampleFrames: Int
+    public let underrunCount: Int
+    public let rebufferCount: Int
+    public let rebufferDurationMilliseconds: Int
+    public let maximumQueuedSampleFrames: Int
 }
 
 public struct AudioPipelineEvidenceWindowTracker: Sendable {
@@ -160,6 +171,17 @@ public struct AudioPipelineEvidenceWindowTracker: Sendable {
     private var outputSourceSpanCount = 0
     private var firstOutputStartQPCPosition: UInt64?
     private var lastOutputEndQPCPosition: UInt64?
+    private var configuredLatencyMilliseconds: Int?
+    private var effectiveTargetSampleFrames: Int?
+    private var queuedOutputBuffers = 0
+    private var queuedOutputSampleFrames = 0
+    private var scheduledPendingSampleFrames = 0
+    private var trimmedOutputBuffers = 0
+    private var trimmedOutputSampleFrames = 0
+    private var underrunCount = 0
+    private var rebufferCount = 0
+    private var rebufferDurationMilliseconds = 0
+    private var maximumQueuedSampleFrames = 0
 
     public init(windowStart: Date) {
         self.windowStart = windowStart
@@ -221,6 +243,35 @@ public struct AudioPipelineEvidenceWindowTracker: Sendable {
         carrySampleFrames = sampleFrameCount
     }
 
+    public mutating func recordJitterBuffer(
+        configuredLatencyMilliseconds: Int,
+        effectiveTargetSampleFrames: Int?,
+        queuedOutputBuffers: Int,
+        queuedOutputSampleFrames: Int,
+        scheduledPendingSampleFrames: Int,
+        trimmedOutputBuffersDelta: Int,
+        trimmedOutputSampleFramesDelta: Int,
+        underrunCountDelta: Int,
+        rebufferCountDelta: Int,
+        rebufferDurationMillisecondsDelta: Int,
+        maximumQueuedSampleFrames: Int
+    ) {
+        self.configuredLatencyMilliseconds = configuredLatencyMilliseconds
+        self.effectiveTargetSampleFrames = effectiveTargetSampleFrames
+        self.queuedOutputBuffers = queuedOutputBuffers
+        self.queuedOutputSampleFrames = queuedOutputSampleFrames
+        self.scheduledPendingSampleFrames = scheduledPendingSampleFrames
+        trimmedOutputBuffers += trimmedOutputBuffersDelta
+        trimmedOutputSampleFrames += trimmedOutputSampleFramesDelta
+        underrunCount += underrunCountDelta
+        rebufferCount += rebufferCountDelta
+        rebufferDurationMilliseconds += rebufferDurationMillisecondsDelta
+        self.maximumQueuedSampleFrames = max(
+            self.maximumQueuedSampleFrames,
+            maximumQueuedSampleFrames
+        )
+    }
+
     public mutating func snapshotAndReset(windowEnd: Date) -> AudioPipelineEvidenceWindowSnapshot {
         let snapshot = AudioPipelineEvidenceWindowSnapshot(
             start: windowStart,
@@ -242,7 +293,18 @@ public struct AudioPipelineEvidenceWindowTracker: Sendable {
             maximumArrivalGapMilliseconds: maximumArrivalGapMilliseconds,
             outputSourceSpanCount: outputSourceSpanCount,
             firstOutputStartQPCPosition: firstOutputStartQPCPosition,
-            lastOutputEndQPCPosition: lastOutputEndQPCPosition
+            lastOutputEndQPCPosition: lastOutputEndQPCPosition,
+            configuredLatencyMilliseconds: configuredLatencyMilliseconds,
+            effectiveTargetSampleFrames: effectiveTargetSampleFrames,
+            queuedOutputBuffers: queuedOutputBuffers,
+            queuedOutputSampleFrames: queuedOutputSampleFrames,
+            scheduledPendingSampleFrames: scheduledPendingSampleFrames,
+            trimmedOutputBuffers: trimmedOutputBuffers,
+            trimmedOutputSampleFrames: trimmedOutputSampleFrames,
+            underrunCount: underrunCount,
+            rebufferCount: rebufferCount,
+            rebufferDurationMilliseconds: rebufferDurationMilliseconds,
+            maximumQueuedSampleFrames: maximumQueuedSampleFrames
         )
 
         windowStart = windowEnd
@@ -263,6 +325,12 @@ public struct AudioPipelineEvidenceWindowTracker: Sendable {
         outputSourceSpanCount = 0
         firstOutputStartQPCPosition = nil
         lastOutputEndQPCPosition = nil
+        trimmedOutputBuffers = 0
+        trimmedOutputSampleFrames = 0
+        underrunCount = 0
+        rebufferCount = 0
+        rebufferDurationMilliseconds = 0
+        maximumQueuedSampleFrames = 0
         return snapshot
     }
 }
