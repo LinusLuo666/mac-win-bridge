@@ -113,6 +113,29 @@ func pcmSamples(_ buffer: AVAudioPCMBuffer, channel: Int) throws -> [Float] {
     )
 }
 
+func reblockedOutput(
+    qpcPosition: UInt64,
+    sampleRate: Int = 48_000,
+    channels: Int = 2
+) throws -> ReblockedPCMOutput {
+    let reblocker = PCMReblocker()
+    let samples = Array(
+        repeating: [Float](repeating: Float(qpcPosition), count: PCMReblocker.outputFrameCount),
+        count: channels
+    )
+    let outputs = try reblocker.append(
+        PCMInputBlock(
+            sampleRate: sampleRate,
+            qpcPosition: qpcPosition,
+            channels: samples
+        )
+    )
+    guard let output = outputs.first else {
+        throw TestFailure(description: "expected one reblocked output")
+    }
+    return output
+}
+
 func appendUInt16LE(_ value: UInt16, to data: inout Data) {
     data.append(UInt8(value & 0xFF))
     data.append(UInt8((value >> 8) & 0xFF))
@@ -487,6 +510,144 @@ let tests: [(String, () throws -> Void)] = [
         reblocker.stop()
 
         try expectEqual(reblocker.carrySampleFrames, 0, "stop clears carry")
+    }),
+    ("Audio latency setting validates whole milliseconds in range", {
+        try expectEqual(AudioLatencySetting.defaultMilliseconds, 50, "default latency")
+        try expectEqual(AudioLatencySetting.parse("10"), 10, "minimum latency")
+        try expectEqual(AudioLatencySetting.parse("50"), 50, "balanced latency")
+        try expectEqual(AudioLatencySetting.parse("120"), 120, "maximum latency")
+        try expectNil(AudioLatencySetting.parse("9"), "below minimum")
+        try expectNil(AudioLatencySetting.parse("121"), "above maximum")
+        try expectNil(AudioLatencySetting.parse("50.5"), "fractional milliseconds")
+        try expectNil(AudioLatencySetting.parse("abc"), "non-numeric latency")
+    }),
+    ("PCM jitter buffer rounds latency thresholds to 512-frame blocks", {
+        let low = PCMOutputJitterBuffer.thresholds(
+            sampleRate: 48_000,
+            requestedLatencyMilliseconds: 10
+        )
+        let balanced = PCMOutputJitterBuffer.thresholds(
+            sampleRate: 48_000,
+            requestedLatencyMilliseconds: 50
+        )
+        let stable = PCMOutputJitterBuffer.thresholds(
+            sampleRate: 48_000,
+            requestedLatencyMilliseconds: 120
+        )
+
+        try expectEqual(low.targetSampleFrames, 512, "10 ms target")
+        try expectEqual(low.maximumSampleFrames, 1_536, "10 ms maximum")
+        try expectEqual(balanced.targetSampleFrames, 2_560, "50 ms target")
+        try expectEqual(balanced.maximumSampleFrames, 3_584, "50 ms maximum")
+        try expectEqual(stable.targetSampleFrames, 6_144, "120 ms target")
+        try expectEqual(stable.maximumSampleFrames, 7_168, "120 ms maximum")
+    }),
+    ("PCM jitter buffer primes before returning oldest source block", {
+        let buffer = PCMOutputJitterBuffer(requestedLatencyMilliseconds: 50)
+        let waiterStarted = DispatchSemaphore(value: 0)
+        let waiterFinished = DispatchSemaphore(value: 0)
+        let scheduledQPC = ThreadSafeBox<UInt64?>(nil)
+
+        Thread {
+            waiterStarted.signal()
+            scheduledQPC.set(buffer.waitForNextToSchedule()?.startQPCPosition)
+            waiterFinished.signal()
+        }.start()
+
+        try expectEqual(waiterStarted.wait(timeout: .now() + 1), .success, "waiter started")
+        _ = buffer.enqueue(try (0..<4).map { try reblockedOutput(qpcPosition: UInt64($0 + 1)) })
+        try expectEqual(
+            waiterFinished.wait(timeout: .now() + 0.05),
+            .timedOut,
+            "four blocks remain below the 50 ms target"
+        )
+
+        _ = buffer.enqueue([try reblockedOutput(qpcPosition: 5)])
+        try expectEqual(waiterFinished.wait(timeout: .now() + 1), .success, "target wakes waiter")
+        try expectEqual(scheduledQPC.get(), 1, "oldest QPC is scheduled first")
+
+        let snapshot = buffer.snapshot()
+        try expectEqual(snapshot.state, .playing, "state after priming")
+        try expectEqual(snapshot.queuedOutputSampleFrames, 2_048, "four blocks remain queued")
+        try expectEqual(snapshot.scheduledPendingSampleFrames, 512, "one block is pending")
+        buffer.stop()
+    }),
+    ("PCM jitter buffer preserves bounded bursts and trims oldest overflow", {
+        let buffer = PCMOutputJitterBuffer(requestedLatencyMilliseconds: 50)
+        let firstFive = try (0..<5).map { try reblockedOutput(qpcPosition: UInt64($0 + 1)) }
+        let withinMargin = try (5..<7).map { try reblockedOutput(qpcPosition: UInt64($0 + 1)) }
+
+        let initial = buffer.enqueue(firstFive)
+        let bounded = buffer.enqueue(withinMargin)
+        let overflow = buffer.enqueue([try reblockedOutput(qpcPosition: 8)])
+
+        try expectEqual(initial.trimmedOutputBuffers, 0, "target fill is retained")
+        try expectEqual(bounded.trimmedOutputBuffers, 0, "burst inside margin is retained")
+        try expectEqual(overflow.trimmedOutputBuffers, 3, "overflow trims back to target")
+        try expectEqual(overflow.trimmedOutputSampleFrames, 1_536, "trimmed sample frames")
+        try expectEqual(buffer.snapshot().queuedOutputSampleFrames, 2_560, "queue returns to target")
+        try expectEqual(
+            buffer.waitForNextToSchedule()?.startQPCPosition,
+            4,
+            "oldest retained block follows the trimmed blocks"
+        )
+        buffer.stop()
+    }),
+    ("PCM jitter buffer re-primes after underrun and records duration", {
+        let buffer = PCMOutputJitterBuffer(requestedLatencyMilliseconds: 10)
+        _ = buffer.enqueue(
+            [try reblockedOutput(qpcPosition: 10)],
+            at: Date(timeIntervalSince1970: 1)
+        )
+        let scheduled = buffer.waitForNextToSchedule()
+        try expectEqual(scheduled?.startQPCPosition, 10, "scheduled block")
+
+        buffer.completeScheduled(
+            sampleFrames: PCMReblocker.outputFrameCount,
+            at: Date(timeIntervalSince1970: 2)
+        )
+        try expectEqual(buffer.snapshot().state, .priming, "empty playback re-primes")
+
+        _ = buffer.enqueue(
+            [try reblockedOutput(qpcPosition: 20)],
+            at: Date(timeIntervalSince1970: 3)
+        )
+        let snapshot = buffer.snapshot()
+        try expectEqual(snapshot.state, .playing, "target resumes playback")
+        try expectEqual(snapshot.underrunCount, 1, "underrun count")
+        try expectEqual(snapshot.rebufferCount, 1, "rebuffer count")
+        try expectEqual(snapshot.totalRebufferDurationMilliseconds, 1_000, "rebuffer duration")
+        buffer.stop()
+    }),
+    ("PCM jitter buffer conserves queued and trimmed sample frames", {
+        let buffer = PCMOutputJitterBuffer(requestedLatencyMilliseconds: 50)
+        for qpc in 1...20 {
+            _ = buffer.enqueue([try reblockedOutput(qpcPosition: UInt64(qpc))])
+        }
+        let snapshot = buffer.snapshot()
+        try expectEqual(
+            snapshot.queuedOutputSampleFrames + snapshot.trimmedOutputSampleFrames,
+            20 * PCMReblocker.outputFrameCount,
+            "queued plus trimmed equals all input output frames"
+        )
+        buffer.stop()
+    }),
+    ("PCM jitter buffer stop wakes a priming waiter", {
+        let buffer = PCMOutputJitterBuffer(requestedLatencyMilliseconds: 50)
+        let waiterStarted = DispatchSemaphore(value: 0)
+        let waiterFinished = DispatchSemaphore(value: 0)
+        let waiterResult = ThreadSafeBox<ReblockedPCMOutput?>(nil)
+
+        Thread {
+            waiterStarted.signal()
+            waiterResult.set(buffer.waitForNextToSchedule())
+            waiterFinished.signal()
+        }.start()
+
+        try expectEqual(waiterStarted.wait(timeout: .now() + 1), .success, "waiter started")
+        buffer.stop()
+        try expectEqual(waiterFinished.wait(timeout: .now() + 1), .success, "stop wakes waiter")
+        try expectNil(waiterResult.get(), "stopped waiter result")
     }),
     ("LatestFrameBuffer keeps only the newest frame", {
         let buffer = LatestFrameBuffer<String>()
