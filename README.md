@@ -46,8 +46,18 @@ Mac 进程需要获得“辅助功能”和“输入监控”权限。按 `Contr
 手动启用音频桥接原型：
 
 ```bash
+# 平衡档（默认 50 ms）
 scripts/start-mac-audio.sh <windows-host-or-ip> 5055
+
+# 低延迟、平衡、稳定三个常用档位
+AUDIO_LATENCY_MS=20 scripts/start-mac-audio.sh <windows-host-or-ip> 5055
+AUDIO_LATENCY_MS=50 scripts/start-mac-audio.sh <windows-host-or-ip> 5055
+AUDIO_LATENCY_MS=80 scripts/start-mac-audio.sh <windows-host-or-ip> 5055
 ```
+
+`AUDIO_LATENCY_MS` 接受 10–120 的整数，默认值为 50。也可以直接向 `mac-controller` 传入 `--audio-latency-ms 10-120`。Mac 会先把 Windows 的 480-frame 输入连续重组为 CoreAudio 使用的 512-frame 输出，再按完整输出块向上取整预缓冲量；48 kHz 下，20/50/80 ms 分别对应约 21.3/53.3/85.3 ms 的有效目标。20 ms 响应更快但对网络或调度抖动更敏感，50 ms 适合作为日常平衡档，80 ms 增加少量延迟以换取更强的抗抖动能力。
+
+播放期间若队列真正耗尽，Mac 会重新预缓冲到所选目标后继续，避免持续断续。若短暂停顿令队列超过“目标值 + 20 ms”上限，则只裁掉最旧的 512-frame 块，使恢复后接近当前声音，而不会永久累积延迟。播放端仍最多同时保留两个已调度、尚未完成的输出块。
 
 `--audio-only` 模式会让 Mac 键盘继续由本机使用。如果需要同时启用键盘转发和音频，请改用 `--audio`。音频模式可以选择 `lowLatency` 或 `stable`；`--muted` 会保持音频流连接，但不在 Mac 本机播放声音。
 
@@ -97,7 +107,7 @@ Windows 管理命令：
 scripts/audio-bridge-manager.py
 ```
 
-在 Mac 上打开 `http://127.0.0.1:8765`。该页面可以启动或停止受管理的 Mac 音频客户端、检查 Windows 端口是否可访问、显示 Windows 启动命令，并查看最近的 Mac 音频日志。
+在 Mac 上打开 `http://127.0.0.1:8765`。该页面可以启动或停止受管理的 Mac 音频客户端、检查 Windows 端口是否可访问、显示 Windows 启动命令，并查看最近的 Mac 音频日志。页面提供 20/50/80 ms 预设和 10–120 ms 滑杆；所选值会持久化，并同时显示按 48 kHz、512-frame 块向上取整后的有效目标。
 
 ### 音频桥接协议
 

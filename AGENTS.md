@@ -31,6 +31,8 @@
 
 ## Current Audio Implementation Boundary
 
-- Keep the TCP latest-frame input buffer at capacity one and the playback queue limiter at capacity two unless new evidence explicitly requires a change.
-- Reblock Windows 480-frame PCM input into 512-frame CoreAudio playback buffers without changing the protocol, TCP `NoDelay`, or Windows write behavior.
+- Keep `LatestFrameBuffer` and its tests for compatibility, but do not put the active audio path back through a capacity-one latest-frame handoff; the TCP receiver must continuously decode, reblock, and enqueue output without waiting for playback.
+- Reblock Windows 480-frame PCM input into continuous 512-frame CoreAudio playback buffers without changing the protocol, TCP `NoDelay`, or Windows write behavior.
+- Use the bounded playback jitter buffer with a configurable whole-number target of 10–120 ms and a 50 ms default. Round the target upward to 512-frame blocks, cap queued plus scheduled audio at the target plus a rounded 20 ms margin, and trim the oldest queued blocks on genuine overflow.
+- Keep the playback queue limiter at capacity two. After a real underrun, re-prime to the configured target before resuming; stop/disconnect must clear carry and queued PCM and wake all waiters.
 - Preserve five-second wall-clock diagnostics and sample-frame accounting for cross-platform validation.
