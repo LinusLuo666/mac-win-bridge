@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import html
 import json
+import math
 import os
 import signal
 import socket
@@ -18,6 +19,9 @@ LOG_FILE = STATE_DIR / "mac-audio.log"
 CONFIG_FILE = STATE_DIR / "config.json"
 DEFAULT_HOST = "192.168.1.13"
 DEFAULT_PORT = 5055
+DEFAULT_LATENCY_MS = 50
+MIN_LATENCY_MS = 10
+MAX_LATENCY_MS = 120
 MANAGER_PORT = int(os.environ.get("AUDIO_BRIDGE_MANAGER_PORT", "8765"))
 
 
@@ -25,22 +29,58 @@ def ensure_state_dir():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def valid_latency_ms(value):
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return DEFAULT_LATENCY_MS
+    if isinstance(value, str) and not value.strip().isdigit():
+        return DEFAULT_LATENCY_MS
+    try:
+        latency = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_LATENCY_MS
+    return latency if MIN_LATENCY_MS <= latency <= MAX_LATENCY_MS else DEFAULT_LATENCY_MS
+
+
+def effective_latency_ms(latency_ms, sample_rate=48_000, block_frames=512):
+    target_frames = math.ceil(sample_rate * latency_ms / 1_000 / block_frames) * block_frames
+    return target_frames * 1_000 / sample_rate
+
+
 def load_config():
     if not CONFIG_FILE.exists():
-        return {"host": DEFAULT_HOST, "port": DEFAULT_PORT}
+        return {
+            "host": DEFAULT_HOST,
+            "port": DEFAULT_PORT,
+            "latency_ms": DEFAULT_LATENCY_MS,
+        }
     try:
         data = json.loads(CONFIG_FILE.read_text())
         return {
             "host": str(data.get("host") or DEFAULT_HOST),
             "port": int(data.get("port") or DEFAULT_PORT),
+            "latency_ms": valid_latency_ms(data.get("latency_ms")),
         }
     except (OSError, ValueError, TypeError):
-        return {"host": DEFAULT_HOST, "port": DEFAULT_PORT}
+        return {
+            "host": DEFAULT_HOST,
+            "port": DEFAULT_PORT,
+            "latency_ms": DEFAULT_LATENCY_MS,
+        }
 
 
-def save_config(host, port):
+def save_config(host, port, latency_ms):
     ensure_state_dir()
-    CONFIG_FILE.write_text(json.dumps({"host": host, "port": port}, indent=2) + "\n")
+    CONFIG_FILE.write_text(
+        json.dumps(
+            {
+                "host": host,
+                "port": port,
+                "latency_ms": valid_latency_ms(latency_ms),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 def process_alive(pid):
@@ -90,23 +130,27 @@ def tail_log(lines=80):
     return "\n".join(content[-lines:])
 
 
-def start_audio(host, port):
+def start_audio(host, port, latency_ms):
     ensure_state_dir()
-    save_config(host, port)
+    latency_ms = valid_latency_ms(latency_ms)
+    save_config(host, port, latency_ms)
     pid = managed_pid()
     if pid:
         return f"Mac audio is already managed by PID {pid}."
 
     log = LOG_FILE.open("ab", buffering=0)
+    environment = os.environ.copy()
+    environment["AUDIO_LATENCY_MS"] = str(latency_ms)
     process = subprocess.Popen(
         [str(ROOT / "scripts" / "start-mac-audio.sh"), host, str(port)],
         cwd=str(ROOT),
         stdout=log,
         stderr=subprocess.STDOUT,
         start_new_session=True,
+        env=environment,
     )
     PID_FILE.write_text(f"{process.pid}\n")
-    return f"Started Mac audio PID {process.pid} for {host}:{port}."
+    return f"Started Mac audio PID {process.pid} for {host}:{port} at {latency_ms} ms."
 
 
 def stop_audio():
@@ -144,6 +188,7 @@ def stop_audio():
 
 def render_page(message=""):
     config = load_config()
+    effective_latency = effective_latency_ms(config["latency_ms"])
     pid = managed_pid()
     reachable, reach_message = tcp_status(config["host"], config["port"])
     detected = detect_audio_processes()
@@ -236,6 +281,15 @@ def render_page(message=""):
       align-items: end;
     }}
     label {{ color: var(--muted); display: grid; gap: 4px; }}
+    .latency-control {{
+      grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: minmax(180px, 1fr) 100px auto;
+      gap: 10px;
+      align-items: end;
+    }}
+    .latency-presets {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+    .latency-note {{ color: var(--muted); margin-top: 6px; }}
     input {{
       width: 100%;
       border: 1px solid var(--line);
@@ -283,6 +337,7 @@ def render_page(message=""):
     @media (max-width: 760px) {{
       .grid {{ grid-template-columns: 1fr; }}
       form {{ grid-template-columns: 1fr; }}
+      .latency-control {{ grid-template-columns: 1fr; }}
       header {{ display: block; }}
     }}
   </style>
@@ -301,6 +356,7 @@ def render_page(message=""):
         <div class="key">Managed Mac audio</div><div class="value">{html.escape(status_text)}</div>
         <div class="key">Managed PID</div><div class="value">{html.escape(str(pid) if pid else "-")}</div>
         <div class="key">Windows target</div><div class="value">{html.escape(config["host"])}:{config["port"]}</div>
+        <div class="key">Audio latency</div><div class="value">{config["latency_ms"]} ms requested / {effective_latency:.1f} ms effective</div>
         <div class="key">Port check</div><div class="value">{html.escape(reach_text)} ({html.escape(reach_message)})</div>
       </div>
     </section>
@@ -311,6 +367,20 @@ def render_page(message=""):
         <label>Port<input name="port" value="{config["port"]}" inputmode="numeric"></label>
         <button class="primary" type="submit">Start</button>
         <button class="danger" type="submit" formaction="/stop">Stop</button>
+        <div class="latency-control">
+          <label>Latency balance
+            <input id="latency-range" type="range" name="latency_range" min="10" max="120" step="1" value="{config["latency_ms"]}">
+          </label>
+          <label>Milliseconds
+            <input id="latency-number" name="latency_ms" type="number" min="10" max="120" step="1" value="{config["latency_ms"]}">
+          </label>
+          <div class="latency-presets">
+            <button type="button" data-latency="20">20 ms</button>
+            <button type="button" data-latency="50">50 ms</button>
+            <button type="button" data-latency="80">80 ms</button>
+          </div>
+        </div>
+        <div id="latency-effective" class="latency-note full">{effective_latency:.1f} ms effective after 512-frame rounding at 48 kHz</div>
       </form>
     </section>
     <section class="full">
@@ -327,6 +397,23 @@ def render_page(message=""):
     </section>
   </div>
 </main>
+<script>
+  const range = document.getElementById("latency-range");
+  const number = document.getElementById("latency-number");
+  const effective = document.getElementById("latency-effective");
+  function updateLatency(value) {{
+    const latency = Math.min(120, Math.max(10, Number(value) || 50));
+    range.value = latency;
+    number.value = latency;
+    const frames = Math.ceil(48000 * latency / 1000 / 512) * 512;
+    effective.textContent = `${{(frames * 1000 / 48000).toFixed(1)}} ms effective after 512-frame rounding at 48 kHz`;
+  }}
+  range.addEventListener("input", event => updateLatency(event.target.value));
+  number.addEventListener("input", event => updateLatency(event.target.value));
+  document.querySelectorAll("[data-latency]").forEach(button => {{
+    button.addEventListener("click", () => updateLatency(button.dataset.latency));
+  }});
+</script>
 </body>
 </html>"""
 
@@ -345,12 +432,15 @@ class Handler(BaseHTTPRequestHandler):
             port = int(data.get("port", [str(config["port"])])[0])
         except ValueError:
             port = config["port"]
+        latency_ms = valid_latency_ms(
+            data.get("latency_ms", [str(config["latency_ms"])])[0]
+        )
 
         if self.path == "/start":
-            message = start_audio(host, port)
+            message = start_audio(host, port, latency_ms)
         elif self.path == "/stop":
             message = stop_audio()
-            save_config(host, port)
+            save_config(host, port, latency_ms)
         else:
             self.send_error(404)
             return
