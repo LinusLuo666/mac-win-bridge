@@ -11,6 +11,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WINDOWS_HOST="$1"
 PORT="${2:-5055}"
 AUDIO_MODE="${AUDIO_MODE:-lowLatency}"
+AUDIO_LATENCY_MS="${AUDIO_LATENCY_MS:-50}"
 AUDIO_VOLUME="${AUDIO_VOLUME:-1.0}"
 
 exec swift run \
@@ -18,4 +19,5 @@ exec swift run \
   mac-controller "$WINDOWS_HOST" "$PORT" \
   --audio-only \
   --audio-mode "$AUDIO_MODE" \
+  --audio-latency-ms "$AUDIO_LATENCY_MS" \
   --volume "$AUDIO_VOLUME"

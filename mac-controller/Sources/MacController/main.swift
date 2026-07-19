@@ -159,6 +159,7 @@ struct ControllerOptions {
     let keyboardEnabled: Bool
     let audioEnabled: Bool
     let audioMode: AudioBridgeMode
+    let audioLatencyMilliseconds: Int
     let volume: Double
     let muted: Bool
 
@@ -170,6 +171,7 @@ struct ControllerOptions {
         var keyboardEnabled = true
         var audioEnabled = false
         var audioMode = AudioBridgeMode.lowLatency
+        var audioLatencyMilliseconds = AudioLatencySetting.defaultMilliseconds
         var volume = 1.0
         var muted = false
         var index = 3
@@ -190,6 +192,14 @@ struct ControllerOptions {
                 }
 
                 audioMode = mode
+                index += 2
+            case "--audio-latency-ms":
+                guard index + 1 < args.count,
+                      let latency = AudioLatencySetting.parse(args[index + 1]) else {
+                    return nil
+                }
+
+                audioLatencyMilliseconds = latency
                 index += 2
             case "--volume":
                 guard index + 1 < args.count,
@@ -213,6 +223,7 @@ struct ControllerOptions {
             keyboardEnabled: keyboardEnabled,
             audioEnabled: audioEnabled,
             audioMode: audioMode,
+            audioLatencyMilliseconds: audioLatencyMilliseconds,
             volume: volume,
             muted: muted
         )
@@ -244,6 +255,7 @@ func runAudioOnly(options: ControllerOptions) -> Never {
                 inputStream: sender.audioInputStream(),
                 volume: options.volume,
                 muted: options.muted,
+                latencyMilliseconds: options.audioLatencyMilliseconds,
                 onTermination: { error in
                     if let error {
                         AudioRuntimeLog.write("audio connection ended: \(error)")
@@ -255,7 +267,9 @@ func runAudioOnly(options: ControllerOptions) -> Never {
             )
             player?.start()
             try sender.send(audioControlMessage(options: options, enabled: true))
-            AudioRuntimeLog.write("audio bridge requested mode=\(options.audioMode.rawValue)")
+            AudioRuntimeLog.write(
+                "audio bridge requested mode=\(options.audioMode.rawValue) latencyMs=\(options.audioLatencyMilliseconds)"
+            )
             AudioRuntimeLog.write("audio-only mode connected to \(options.windowsHost):\(options.port); keyboard remains local")
             disconnected.wait()
         } catch {
@@ -276,7 +290,7 @@ func runAudioOnly(options: ControllerOptions) -> Never {
 
 let args = CommandLine.arguments
 guard let options = ControllerOptions.parse(args) else {
-    print("usage: mac-controller <windows-host> <port> [--audio|--audio-only] [--audio-mode lowLatency|stable] [--volume 0.0-1.0] [--muted]")
+    print("usage: mac-controller <windows-host> <port> [--audio|--audio-only] [--audio-mode lowLatency|stable] [--audio-latency-ms 10-120] [--volume 0.0-1.0] [--muted]")
     exit(64)
 }
 
@@ -304,6 +318,7 @@ if options.audioEnabled {
             inputStream: sender.audioInputStream(),
             volume: options.volume,
             muted: options.muted,
+            latencyMilliseconds: options.audioLatencyMilliseconds,
             onTermination: { error in
                 if let error {
                     AudioRuntimeLog.write("audio connection ended: \(error)")
@@ -313,7 +328,9 @@ if options.audioEnabled {
         )
         audioPlayer?.start()
         try sender.send(audioControlMessage(options: options, enabled: true))
-        AudioRuntimeLog.write("audio bridge requested mode=\(options.audioMode.rawValue)")
+        AudioRuntimeLog.write(
+            "audio bridge requested mode=\(options.audioMode.rawValue) latencyMs=\(options.audioLatencyMilliseconds)"
+        )
     } catch {
         AudioRuntimeLog.write("audio setup failed: \(error)")
         exit(69)
